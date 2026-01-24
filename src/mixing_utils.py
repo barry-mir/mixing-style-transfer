@@ -16,11 +16,30 @@ from scipy.signal import butter, sosfilt
 class MixingFeatureExtractor:
     """Extract interpretable mixing features from audio stems."""
 
-    def __init__(self, sample_rate=44100, n_fft=1024, hop_length=256, n_mels=128):
+    def __init__(
+        self,
+        sample_rate=44100,
+        n_fft=1024,
+        hop_length=256,
+        n_mels=128,
+        use_detailed_spectral=False,
+        n_spectral_bins=32
+    ):
+        """
+        Args:
+            sample_rate: Audio sample rate
+            n_fft: FFT size
+            hop_length: Hop length for STFT
+            n_mels: Number of mel bands
+            use_detailed_spectral: If True, use detailed frequency curve instead of 3 bands
+            n_spectral_bins: Number of frequency bins for detailed spectral features
+        """
         self.sr = sample_rate
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.n_mels = n_mels
+        self.use_detailed_spectral = use_detailed_spectral
+        self.n_spectral_bins = n_spectral_bins
 
         # Mel spectrogram transform
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
@@ -30,6 +49,24 @@ class MixingFeatureExtractor:
             n_mels=n_mels,
             power=2.0
         )
+
+    def get_feature_dim(self):
+        """
+        Get total feature dimension based on configuration.
+
+        Returns:
+            total_dim: Total number of features
+        """
+        # Per-stem features
+        dynamics_dim = 6
+        spectral_dim = 5 if not self.use_detailed_spectral else (self.n_spectral_bins + 2)
+        stereo_dim = 3
+        per_stem_dim = dynamics_dim + spectral_dim + stereo_dim
+
+        # Total: 4 stems × per_stem_dim + 4 rel_loudness + 4 masking
+        total_dim = 4 * per_stem_dim + 4 + 4
+
+        return total_dim
 
     def extract_all_features(self, stems_dict, mixture):
         """
@@ -85,14 +122,29 @@ class MixingFeatureExtractor:
 
         # Loudness (simplified LUFS approximation)
         loudness = self.compute_loudness(audio)
-        features.append(torch.tensor([loudness, loudness]))  # Repeat for stereo
+        features.append(torch.tensor([loudness, loudness], device=audio.device))  # Repeat for stereo
         if torch.isnan(loudness).any():
             print(f"[extract_dynamics] NaN in loudness: {loudness}")
 
         return torch.cat(features)  # (6,)
 
     def extract_spectral(self, audio):
-        """Extract spectral features: band energies, tilt, flatness."""
+        """
+        Extract spectral features.
+
+        Old mode (use_detailed_spectral=False):
+            Returns 5 features: low_energy, mid_energy, high_energy, tilt, flatness
+
+        New mode (use_detailed_spectral=True):
+            Returns n_spectral_bins + 2 features:
+            - n_spectral_bins: detailed frequency curve (subsampled mel energies)
+            - tilt: spectral tilt
+            - flatness: spectral flatness
+        """
+        # Move mel_transform to same device as audio
+        if self.mel_transform.spectrogram.window.device != audio.device:
+            self.mel_transform = self.mel_transform.to(audio.device)
+
         # Compute mel spectrogram
         mel_spec = self.mel_transform(audio)  # (2, n_mels, T)
         mel_spec_db = 10 * torch.log10(mel_spec + 1e-10)
@@ -104,36 +156,74 @@ class MixingFeatureExtractor:
         if torch.isnan(mel_energy).any():
             print(f"[extract_spectral] NaN in mel_energy: {mel_energy}")
 
-        # Spectral statistics
-        low_band_bound = mel_energy.shape[0] // 4
-        high_band_bound = mel_energy.shape[0] // 4 * 3
-        low_energy = mel_energy[:low_band_bound].mean()  # Low frequencies
-        mid_energy = mel_energy[low_band_bound:high_band_bound].mean()  # Mid frequencies
-        high_energy = mel_energy[high_band_bound:].mean()  # High frequencies
-        if torch.isnan(low_energy).any():
-            print(f"[extract_spectral] NaN in low_energy: {low_energy}")
-        if torch.isnan(mid_energy).any():
-            print(f"[extract_spectral] NaN in mid_energy: {mid_energy}")
-        if torch.isnan(high_energy).any():
-            print(f"[extract_spectral] NaN in high_energy: {high_energy}")
+        if not self.use_detailed_spectral:
+            # OLD MODE: 3-band energy + tilt + flatness (5 features)
+            # Spectral statistics
+            low_band_bound = mel_energy.shape[0] // 4
+            high_band_bound = mel_energy.shape[0] // 4 * 3
+            low_energy = mel_energy[:low_band_bound].mean()  # Low frequencies
+            mid_energy = mel_energy[low_band_bound:high_band_bound].mean()  # Mid frequencies
+            high_energy = mel_energy[high_band_bound:].mean()  # High frequencies
+            if torch.isnan(low_energy).any():
+                print(f"[extract_spectral] NaN in low_energy: {low_energy}")
+            if torch.isnan(mid_energy).any():
+                print(f"[extract_spectral] NaN in mid_energy: {mid_energy}")
+            if torch.isnan(high_energy).any():
+                print(f"[extract_spectral] NaN in high_energy: {high_energy}")
 
-        # Spectral tilt (slope of energy across frequency)
-        freq_bins = torch.arange(self.n_mels, dtype=torch.float32, device=audio.device)
-        # Handle case where mel_energy is constant (would cause NaN in corrcoef)
-        if mel_energy.std() < 1e-6:
-            tilt = torch.tensor(0.0, device=audio.device)
+            # Spectral tilt (slope of energy across frequency)
+            freq_bins = torch.arange(self.n_mels, dtype=torch.float32, device=audio.device)
+            # Handle case where mel_energy is constant (would cause NaN in corrcoef)
+            if mel_energy.std() < 1e-6:
+                tilt = torch.tensor(0.0, device=audio.device)
+            else:
+                tilt = torch.corrcoef(torch.stack([freq_bins, mel_energy]))[0, 1]
+            if torch.isnan(tilt).any():
+                print(f"[extract_spectral] NaN in tilt: {tilt}, mel_energy.std={mel_energy.std()}")
+
+            # Spectral flatness (geometric mean / arithmetic mean)
+            flatness = torch.exp(torch.mean(torch.log(mel_spec + 1e-10))) / (torch.mean(mel_spec) + 1e-10)
+            if torch.isnan(flatness).any():
+                print(f"[extract_spectral] NaN in flatness: {flatness}")
+
+            features = torch.tensor([low_energy, mid_energy, high_energy, tilt, flatness], device=audio.device)
+            return features  # (5,)
+
         else:
-            tilt = torch.corrcoef(torch.stack([freq_bins, mel_energy]))[0, 1]
-        if torch.isnan(tilt).any():
-            print(f"[extract_spectral] NaN in tilt: {tilt}, mel_energy.std={mel_energy.std()}")
+            # NEW MODE: Detailed frequency curve + tilt + flatness
+            # Subsample mel_energy to n_spectral_bins
+            if self.n_spectral_bins >= self.n_mels:
+                # If requesting more bins than available, just use all mel bins
+                detailed_curve = mel_energy
+            else:
+                # Interpolate to get n_spectral_bins
+                indices = torch.linspace(0, self.n_mels - 1, self.n_spectral_bins, device=audio.device)
+                # Use linear interpolation
+                detailed_curve = torch.nn.functional.interpolate(
+                    mel_energy.unsqueeze(0).unsqueeze(0),  # (1, 1, n_mels)
+                    size=self.n_spectral_bins,
+                    mode='linear',
+                    align_corners=True
+                ).squeeze()  # (n_spectral_bins,)
 
-        # Spectral flatness (geometric mean / arithmetic mean)
-        flatness = torch.exp(torch.mean(torch.log(mel_spec + 1e-10))) / (torch.mean(mel_spec) + 1e-10)
-        if torch.isnan(flatness).any():
-            print(f"[extract_spectral] NaN in flatness: {flatness}")
+            # Spectral tilt (slope of energy across frequency)
+            freq_bins = torch.arange(self.n_spectral_bins, dtype=torch.float32, device=audio.device)
+            # Handle case where detailed_curve is constant (would cause NaN in corrcoef)
+            if detailed_curve.std() < 1e-6:
+                tilt = torch.tensor(0.0, device=audio.device)
+            else:
+                tilt = torch.corrcoef(torch.stack([freq_bins, detailed_curve]))[0, 1]
+            if torch.isnan(tilt).any():
+                print(f"[extract_spectral] NaN in tilt: {tilt}, detailed_curve.std={detailed_curve.std()}")
 
-        features = torch.tensor([low_energy, mid_energy, high_energy, tilt, flatness])
-        return features  # (5,)
+            # Spectral flatness (geometric mean / arithmetic mean)
+            flatness = torch.exp(torch.mean(torch.log(mel_spec + 1e-10))) / (torch.mean(mel_spec) + 1e-10)
+            if torch.isnan(flatness).any():
+                print(f"[extract_spectral] NaN in flatness: {flatness}")
+
+            # Combine: detailed_curve (n_spectral_bins) + tilt + flatness
+            features = torch.cat([detailed_curve, torch.tensor([tilt, flatness], device=audio.device)])
+            return features  # (n_spectral_bins + 2,)
 
     def extract_stereo(self, audio):
         """Extract stereo features: ILD, correlation, MSR."""
@@ -164,11 +254,16 @@ class MixingFeatureExtractor:
         if torch.isnan(msr).any():
             print(f"[extract_stereo] NaN in MSR: {msr}, E_mid={E_mid}, E_side={E_side}")
 
-        features = torch.tensor([ild, corr, msr])
+        features = torch.tensor([ild, corr, msr], device=L.device)
         return features  # (3,)
 
     def extract_masking(self, stems_dict):
         """Extract inter-stem masking features."""
+        # Move mel_transform to correct device (use first stem's device)
+        first_stem_audio = next(iter(stems_dict.values()))
+        if self.mel_transform.spectrogram.window.device != first_stem_audio.device:
+            self.mel_transform = self.mel_transform.to(first_stem_audio.device)
+
         # Compute mel spectrograms for all stems
         stem_mels = {}
         for stem_name, stem_audio in stems_dict.items():
@@ -201,7 +296,7 @@ class MixingFeatureExtractor:
                 print(f"[extract_masking] NaN in avg_masking for {stem_name}: {avg_masking}")
             masking_features.append(avg_masking)
 
-        return torch.tensor(masking_features)  # (4,)
+        return torch.stack(masking_features)  # (4,)
 
     def compute_loudness(self, audio):
         """Simplified LUFS loudness computation."""
@@ -215,12 +310,17 @@ class MixingFeatureExtractor:
     def _flatten_features(self, features):
         """Flatten feature dict into a single vector."""
         vectors = []
+        device = None
         for key in sorted(features.keys()):
             feat = features[key]
             if isinstance(feat, torch.Tensor):
                 vectors.append(feat.flatten())
+                if device is None:
+                    device = feat.device
             else:
-                vectors.append(torch.tensor([feat]))
+                if device is None:
+                    device = torch.device('cpu')  # Default to CPU if no tensor yet
+                vectors.append(torch.tensor([feat], device=device))
 
         result = torch.cat(vectors)
 

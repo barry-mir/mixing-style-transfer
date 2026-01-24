@@ -26,18 +26,14 @@ echo "Using $NUM_WORKERS DataLoader workers"
 echo "Main process threads: 2 (OMP/MKL/OPENBLAS)"
 echo ""
 echo "Baseline setup:"
-echo "  - num_mix_variants=1 (no augmentation)"
-echo "  - num_segments=2 (2 clips per song)"
-echo "  - Positive: same song, different clips"
+echo "  - num_segments=2 (2 temporal clips per song)"
+echo "  - Positive: same song, different temporal segments"
 echo "  - Negative: different songs"
+echo "  - No mixing variants or augmentation"
 echo "=========================================="
 
 python src/train.py \
-    --use_preseparated \
     --separated_path /ssd2/barry/fma_large_separated/ \
-    --data_path /nas/FMA/fma_large/ \
-    --scnet_model_path Music-Source-Separation-Training/model_scnet_masked_ep_111_sdr_9.8286.ckpt \
-    --scnet_config_path Music-Source-Separation-Training/configs/config_musdb18_scnet_xl_ihf.yaml \
     --batch_size 100 \
     --num_epochs 100 \
     --learning_rate 2e-4 \
@@ -50,15 +46,12 @@ python src/train.py \
     --feature_dim 128 \
     --band_split_size 16 \
     --band_overlap 8 \
-    --num_songs_per_batch 80 \
-    --num_mix_variants 1 \
     --num_segments 2 \
-    --aug_prob 0.0 \
-    --aug_gain_range 0.0 \
     --num_workers $NUM_WORKERS \
     --log_interval 10 \
     --save_interval 5 \
     --checkpoint_dir /nas/mixing-representation/checkpoints_baseline_large/ \
     --log_dir /nas/mixing-representation/logs_baseline_large/ \
     --device cuda \
-    --seed 42
+    --seed 42 \
+    --resume /nas/mixing-representation/checkpoints_baseline_large/checkpoint_epoch_20.pt

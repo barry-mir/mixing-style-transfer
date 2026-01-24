@@ -314,8 +314,8 @@ def optimize_tcn_features(
         features = features.to(device)
         features = F.normalize(features, p=2, dim=0)
 
-        # Compute loss directly on features
-        loss = 1.0 - F.cosine_similarity(features.unsqueeze(0), target_features.unsqueeze(0))
+        # Compute loss using mean squared error (MSE) between features
+        loss = F.mse_loss(features, target_features.to(device))
 
         # Track metrics (no grad)
         with torch.no_grad():
@@ -351,6 +351,245 @@ def optimize_tcn_features(
     }
 
 
+class MultiResolutionSTFTLoss(torch.nn.Module):
+    """
+    Multi-resolution STFT loss for audio quality preservation.
+    Computes spectral loss at multiple FFT sizes.
+    """
+    def __init__(self, fft_sizes=[1024, 2048, 512], hop_sizes=[256, 512, 128],
+                 win_sizes=[1024, 2048, 512], window='hann'):
+        super().__init__()
+        self.fft_sizes = fft_sizes
+        self.hop_sizes = hop_sizes
+        self.win_sizes = win_sizes
+        self.window = window
+
+    def stft(self, x, fft_size, hop_size, win_size):
+        """Compute STFT"""
+        # x: (B, C, T) or (C, T)
+        if x.ndim == 2:
+            x = x.unsqueeze(0)  # (1, C, T)
+
+        B, C, T = x.shape
+        # Merge batch and channel for STFT
+        x_flat = x.reshape(B * C, T)  # (B*C, T)
+
+        # Create window
+        window_tensor = torch.hann_window(win_size, device=x.device)
+
+        # STFT
+        spec = torch.stft(
+            x_flat,
+            n_fft=fft_size,
+            hop_length=hop_size,
+            win_length=win_size,
+            window=window_tensor,
+            return_complex=True
+        )  # (B*C, freq, time)
+
+        return spec
+
+    def spectral_convergence(self, x_mag, y_mag):
+        """Spectral convergence loss"""
+        return torch.norm(y_mag - x_mag, p='fro') / torch.norm(y_mag, p='fro')
+
+    def log_stft_magnitude(self, x_mag, y_mag):
+        """Log STFT magnitude loss"""
+        return F.l1_loss(torch.log(x_mag + 1e-5), torch.log(y_mag + 1e-5))
+
+    def forward(self, x, y):
+        """
+        Args:
+            x: predicted audio (B, C, T) or (C, T)
+            y: target audio (B, C, T) or (C, T)
+
+        Returns:
+            loss: scalar
+        """
+        total_loss = 0.0
+
+        for fft_size, hop_size, win_size in zip(self.fft_sizes, self.hop_sizes, self.win_sizes):
+            # Compute STFT
+            x_spec = self.stft(x, fft_size, hop_size, win_size)
+            y_spec = self.stft(y, fft_size, hop_size, win_size)
+
+            # Magnitude
+            x_mag = torch.abs(x_spec)
+            y_mag = torch.abs(y_spec)
+
+            # Spectral convergence + log magnitude
+            sc_loss = self.spectral_convergence(x_mag, y_mag)
+            log_loss = self.log_stft_magnitude(x_mag, y_mag)
+
+            total_loss += sc_loss + log_loss
+
+        return total_loss / len(self.fft_sizes)
+
+
+def optimize_tcn_cycle_consistency(
+    tcn_forward,
+    tcn_backward,
+    stems_input,
+    target_emb,
+    mixing_model,
+    feature_extractor,
+    device,
+    num_steps=500,
+    lr=0.001,
+    lambda_recon=10.0,
+    lambda_waveform=1.0,
+    verbose=True,
+    optimize_target_type='embeddings'
+):
+    """
+    Optimize TCN with cycle-consistency:
+    - Forward: input -> TCN1 -> transferred (match target style)
+    - Backward: transferred -> TCN2 -> reconstructed (match input audio)
+
+    Args:
+        tcn_forward: First TCN (input -> transferred)
+        tcn_backward: Second TCN (transferred -> reconstructed)
+        stems_input: Input stems dict
+        target_emb: Target embedding or features
+        mixing_model: Encoder for embeddings
+        feature_extractor: For features
+        device: torch device
+        num_steps: Optimization steps
+        lr: Learning rate
+        lambda_recon: Weight for reconstruction MRSTFT loss
+        lambda_waveform: Weight for waveform L1 loss
+        verbose: Print progress
+        optimize_target_type: 'embeddings' or 'features'
+
+    Returns:
+        dict with processed_stems, processed_mixture, iteration_log, etc.
+    """
+    # Stack stems for TCN: (8, T)
+    stem_order = ['vocals', 'bass', 'drums', 'other']
+    stems_list = [stems_input[name] for name in stem_order]
+    stacked_stems = torch.cat(stems_list, dim=0).unsqueeze(0).to(device)  # (1, 8, T)
+    stacked_stems.requires_grad = False
+
+    # Initialize TCNs
+    tcn_forward = tcn_forward.to(device)
+    tcn_backward = tcn_backward.to(device)
+    tcn_forward.train()
+    tcn_backward.train()
+
+    # MRSTFT loss for reconstruction
+    mrstft_loss = MultiResolutionSTFTLoss().to(device)
+
+    # Optimizer for both TCNs
+    optimizer = optim.Adam(
+        list(tcn_forward.parameters()) + list(tcn_backward.parameters()),
+        lr=lr
+    )
+
+    # Normalize target
+    if optimize_target_type == 'embeddings':
+        target_emb = F.normalize(target_emb, p=2, dim=0)
+
+    iteration_log = []
+    best_distance = float('inf')
+    best_state = None
+
+    for step in tqdm(range(num_steps), desc="Optimizing (cycle-consistency)"):
+        optimizer.zero_grad()
+
+        # ===== FORWARD PASS: input -> transferred =====
+        transferred_stacked = tcn_forward(stacked_stems)  # (1, 8, T)
+
+        # Unstack transferred stems
+        transferred_stems = {}
+        for i, stem_name in enumerate(stem_order):
+            transferred_stems[stem_name] = transferred_stacked[0, i*2:(i+1)*2, :]  # (2, T)
+
+        # Sum to create mixture
+        transferred_mixture = sum(transferred_stems.values())  # (2, T)
+
+        # Compute style loss (embedding or feature)
+        if optimize_target_type == 'embeddings':
+            # Compute embedding WITH gradients
+            emb = compute_mixing_embedding(
+                transferred_mixture,
+                transferred_stems,
+                mixing_model,
+                feature_extractor,
+                device,
+                requires_grad=True
+            )
+            emb = F.normalize(emb, p=2, dim=0)
+
+            # Style loss: negative cosine similarity
+            style_loss = 1.0 - F.cosine_similarity(emb.unsqueeze(0), target_emb.unsqueeze(0))
+        else:
+            # Feature-based style loss
+            pred_features = feature_extractor.extract_all_features(
+                transferred_stems,
+                transferred_mixture
+            )
+            style_loss = F.mse_loss(pred_features, target_emb)
+
+        # ===== BACKWARD PASS: transferred -> reconstructed =====
+        # Detach transferred to prevent gradient flow from reconstruction to style
+        # (Only TCN_backward should be trained for reconstruction)
+        reconstructed_stacked = tcn_backward(transferred_stacked)  # (1, 8, T)
+
+        # Reconstruction losses
+        # 1. MRSTFT loss (spectral quality)
+        recon_mrstft_loss = mrstft_loss(reconstructed_stacked, stacked_stems)
+
+        # 2. Waveform L1 loss (time-domain)
+        recon_l1_loss = F.l1_loss(reconstructed_stacked, stacked_stems)
+
+        # ===== TOTAL LOSS =====
+        loss = style_loss + lambda_recon * recon_mrstft_loss + lambda_waveform * recon_l1_loss
+
+        # Track metrics (no grad)
+        with torch.no_grad():
+            style_distance = style_loss.item()
+            mrstft_distance = recon_mrstft_loss.item()
+            l1_distance = recon_l1_loss.item()
+            total_distance = loss.item()
+
+            # Track best based on style loss
+            if style_distance < best_distance:
+                best_distance = style_distance
+                best_state = {
+                    'processed_stems': {k: v.detach().cpu() for k, v in transferred_stems.items()},
+                    'processed_mixture': transferred_mixture.detach().cpu(),
+                    'tcn_forward_state': {k: v.cpu().clone() for k, v in tcn_forward.state_dict().items()},
+                    'tcn_backward_state': {k: v.cpu().clone() for k, v in tcn_backward.state_dict().items()}
+                }
+
+            iteration_log.append({
+                'step': step,
+                'style_loss': style_distance,
+                'recon_mrstft_loss': mrstft_distance,
+                'recon_l1_loss': l1_distance,
+                'total_loss': total_distance
+            })
+
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+
+        if verbose and (step % 50 == 0 or step == num_steps - 1):
+            print(f"  Step {step:3d}/{num_steps}: style={style_distance:.4f}, "
+                  f"mrstft={mrstft_distance:.4f}, l1={l1_distance:.4f}, "
+                  f"total={total_distance:.4f}, best_style={best_distance:.4f}")
+
+    return {
+        'processed_stems': best_state['processed_stems'],
+        'processed_mixture': best_state['processed_mixture'],
+        'iteration_log': iteration_log,
+        'final_distance': best_distance,
+        'converged': best_distance < iteration_log[0]['style_loss'] * 0.8,
+        'tcn_forward_state': best_state['tcn_forward_state'],
+        'tcn_backward_state': best_state['tcn_backward_state']
+    }
+
+
 def main():
     import argparse
 
@@ -370,12 +609,26 @@ def main():
     parser.add_argument('--scnet_config', type=str,
                         default='../Music-Source-Separation-Training/configs/config_musdb18_scnet_xl_ihf.yaml',
                         help='Path to SCNet config file')
-    parser.add_argument('--num_steps', type=int, default=500, help='Number of optimization steps')
+    parser.add_argument('--num_steps', type=int, default=250, help='Number of optimization steps')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--receptive_field', type=float, default=2.0, help='TCN receptive field in seconds')
+    parser.add_argument('--receptive_field', type=float, default=5.2,
+                        help='TCN receptive field in seconds (default: 5.2s, reference architecture)')
+    parser.add_argument('--use_detailed_spectral', action='store_true', default=False,
+                        help='Use detailed spectral features (frequency curve) instead of 3-band')
+    parser.add_argument('--n_spectral_bins', type=int, default=32,
+                        help='Number of spectral bins for detailed spectral features')
     parser.add_argument('--segment_duration', type=float, default=10.0, help='Audio segment duration in seconds (default: 10.0)')
     parser.add_argument('--segment_offset', type=float, default=0.0, help='Segment offset in seconds (default: 0.0 for beginning)')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda/cpu)')
+
+    # Cycle-consistency arguments
+    parser.add_argument('--use_cycle_consistency', action='store_true', default=False,
+                        help='Use cycle-consistency loss (two-stage: forward + reconstruction)')
+    parser.add_argument('--lambda_recon', type=float, default=10.0,
+                        help='Weight for reconstruction MRSTFT loss (default: 10.0)')
+    parser.add_argument('--lambda_waveform', type=float, default=1.0,
+                        help='Weight for waveform L1 loss (default: 1.0)')
+
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
@@ -445,7 +698,9 @@ def main():
     feature_extractor = MixingFeatureExtractor(
         sample_rate=44100,
         n_fft=2048,
-        hop_length=512
+        hop_length=512,
+        use_detailed_spectral=args.use_detailed_spectral,
+        n_spectral_bins=args.n_spectral_bins
     )
     print()
 
@@ -485,9 +740,17 @@ def main():
         target_emb_norm = None
         print()
 
-    # Create TCN mixer
-    print(f"Initializing TCN mixer (receptive field: {args.receptive_field}s)...")
-    tcn = create_tcn_mixer(receptive_field_seconds=args.receptive_field)
+    # Create TCN mixer(s)
+    if args.use_cycle_consistency:
+        print(f"Initializing TWO TCN mixers for cycle-consistency (receptive field: {args.receptive_field}s)...")
+        tcn_forward = create_tcn_mixer(receptive_field_seconds=args.receptive_field)
+        tcn_backward = create_tcn_mixer(receptive_field_seconds=args.receptive_field)
+        print(f"  Forward TCN parameters: {sum(p.numel() for p in tcn_forward.parameters()):,}")
+        print(f"  Backward TCN parameters: {sum(p.numel() for p in tcn_backward.parameters()):,}")
+        print(f"  Total parameters: {sum(p.numel() for p in tcn_forward.parameters()) + sum(p.numel() for p in tcn_backward.parameters()):,}")
+    else:
+        print(f"Initializing TCN mixer (receptive field: {args.receptive_field}s)...")
+        tcn = create_tcn_mixer(receptive_field_seconds=args.receptive_field)
     print()
 
     # Compute initial distances
@@ -511,32 +774,60 @@ def main():
     print()
 
     # Run optimization
-    print(f"Running optimization ({args.num_steps} steps, lr={args.lr})...")
-    print()
+    if args.use_cycle_consistency:
+        print(f"Running cycle-consistency optimization ({args.num_steps} steps, lr={args.lr})...")
+        print(f"  lambda_recon (MRSTFT): {args.lambda_recon}")
+        print(f"  lambda_waveform (L1): {args.lambda_waveform}")
+        print()
 
-    if args.optimize_target == 'embeddings':
-        result = optimize_tcn_embeddings(
-            tcn,
+        # Select target based on optimize_target
+        if args.optimize_target == 'embeddings':
+            target = target_emb_norm
+        else:
+            target = target_features_norm
+
+        result = optimize_tcn_cycle_consistency(
+            tcn_forward,
+            tcn_backward,
             input_stems,
-            target_emb_norm,
+            target,
             mixing_model,
             feature_extractor,
             device,
             num_steps=args.num_steps,
             lr=args.lr,
-            verbose=True
+            lambda_recon=args.lambda_recon,
+            lambda_waveform=args.lambda_waveform,
+            verbose=True,
+            optimize_target_type=args.optimize_target
         )
-    else:  # features
-        result = optimize_tcn_features(
-            tcn,
-            input_stems,
-            target_features_norm,
-            feature_extractor,
-            device,
-            num_steps=args.num_steps,
-            lr=args.lr,
-            verbose=True
-        )
+    else:
+        print(f"Running optimization ({args.num_steps} steps, lr={args.lr})...")
+        print()
+
+        if args.optimize_target == 'embeddings':
+            result = optimize_tcn_embeddings(
+                tcn,
+                input_stems,
+                target_emb_norm,
+                mixing_model,
+                feature_extractor,
+                device,
+                num_steps=args.num_steps,
+                lr=args.lr,
+                verbose=True
+            )
+        else:  # features
+            result = optimize_tcn_features(
+                tcn,
+                input_stems,
+                target_features_norm,
+                feature_extractor,
+                device,
+                num_steps=args.num_steps,
+                lr=args.lr,
+                verbose=True
+            )
 
     print()
     print("Optimization complete!")

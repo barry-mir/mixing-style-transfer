@@ -14,8 +14,8 @@ import random
 
 from params import get_params
 from model import MixingStyleEncoder
-from data import FMAContrastiveDataset, SCNetSeparator, collate_fn
-from loss import InfoNCELoss, ContrastiveLossSimple, TwoAxisInfoNCELoss
+from data import SCNetSeparator, FMABaselineDataset, baseline_collate_fn
+from loss import InfoNCELoss
 
 
 def set_seed(seed):
@@ -68,9 +68,9 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args, wr
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     use_amp = scaler is not None
 
-    for batch_idx, (stems_dict, mixing_features, song_labels, variant_labels, segment_labels) in enumerate(pbar):
+    for batch_idx, (stems_dict, mixing_features, song_labels) in enumerate(pbar):
         # Move stems to device
-        stems_dict = {k: v.to(device) for k, v in stems_dict.items()}  # (S×V×T, 2, audio_samples)
+        stems_dict = {k: v.to(device) for k, v in stems_dict.items()}  # (N, 2, T)
         # Check all tensors for NaN values and print their shapes
         for k, v in stems_dict.items():
             if torch.isnan(v).any():
@@ -82,15 +82,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args, wr
         if torch.isnan(song_labels.float()).any():
             print('WARNING: song_labels contains NaN values!')
 
-        if torch.isnan(variant_labels.float()).any():
-            print('WARNING: variant_labels contains NaN values!')
-
-        if torch.isnan(segment_labels.float()).any():
-            print('WARNING: segment_labels contains NaN values!')
-        mixing_features = mixing_features.to(device)  # (S×V×T, feature_dim)
-        song_labels = song_labels.to(device)  # (S×V×T,)
-        variant_labels = variant_labels.to(device)  # (S×V×T,)
-        segment_labels = segment_labels.to(device)  # (S×V×T,)
+        mixing_features = mixing_features.to(device)  # (N, feature_dim)
+        song_labels = song_labels.to(device)  # (N,)
 
         optimizer.zero_grad()
 
@@ -99,12 +92,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args, wr
             with torch.cuda.amp.autocast():
                 embeddings = model(stems_dict, mixing_features)  # (S×V×T, embed_dim)
 
-                # Compute loss based on criterion type
-                if isinstance(criterion, TwoAxisInfoNCELoss):
-                    loss = criterion(embeddings, song_labels, variant_labels, segment_labels)
-                else:
-                    # Baseline InfoNCE: only uses song_labels
-                    loss = criterion(embeddings, song_labels)
+                # Compute InfoNCE loss
+                loss = criterion(embeddings, song_labels)
 
             # Debug: check loss properties
             if batch_idx == 0 and epoch == 0:
@@ -123,12 +112,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args, wr
             # Standard FP32 training
             embeddings = model(stems_dict, mixing_features)
 
-            # Compute loss based on criterion type
-            if isinstance(criterion, TwoAxisInfoNCELoss):
-                loss = criterion(embeddings, song_labels, variant_labels, segment_labels)
-            else:
-                # Baseline InfoNCE: only uses song_labels
-                loss = criterion(embeddings, song_labels)
+            # Compute InfoNCE loss
+            loss = criterion(embeddings, song_labels)
 
             loss.backward()
             optimizer.step()
@@ -170,22 +155,17 @@ def validate_epoch(model, dataloader, criterion, device, epoch, args):
     pbar = tqdm(dataloader, desc=f"Validation Epoch {epoch}")
 
     with torch.no_grad():  # No gradients needed for validation
-        for batch_idx, (stems_dict, mixing_features, song_labels, variant_labels, segment_labels) in enumerate(pbar):
+        for batch_idx, (stems_dict, mixing_features, song_labels) in enumerate(pbar):
             # Move data to device
             stems_dict = {k: v.to(device) for k, v in stems_dict.items()}
             mixing_features = mixing_features.to(device)
             song_labels = song_labels.to(device)
-            variant_labels = variant_labels.to(device)
-            segment_labels = segment_labels.to(device)
 
             # Forward pass (no AMP for validation to save memory)
             embeddings = model(stems_dict, mixing_features)
 
-            # Compute loss
-            if isinstance(criterion, TwoAxisInfoNCELoss):
-                loss = criterion(embeddings, song_labels, variant_labels, segment_labels)
-            else:
-                loss = criterion(embeddings, song_labels)
+            # Compute InfoNCE loss
+            loss = criterion(embeddings, song_labels)
 
             # Update metrics
             loss_value = loss.item()
@@ -222,51 +202,29 @@ def main():
     writer = SummaryWriter(log_dir=args.log_dir)
 
     # Create dataset
-    print("Creating dataset...")
+    print("Creating baseline dataset...")
 
-    # Check if using pre-separated stems (recommended to save VRAM)
-    use_preseparated = hasattr(args, 'use_preseparated') and args.use_preseparated
+    # Use pre-separated stems (required for baseline)
     separated_path = getattr(args, 'separated_path', '/nas/FMA/fma_separated/')
+    print(f"Using pre-separated stems from: {separated_path}")
 
-    if use_preseparated:
-        print(f"Using pre-separated stems from: {separated_path}")
-        scnet_separator = None  # Not needed
-    else:
-        print("⚠️  Using on-the-fly separation (high VRAM usage!)")
-        print("   Consider pre-processing with scripts/preprocess_fma_separation.py")
-        print("Loading SCNet model...")
-        scnet_separator = SCNetSeparator(
-            model_path=args.scnet_model_path,
-            config_path=args.scnet_config_path,
-            device=device
-        )
-        print("SCNet model loaded successfully")
-
-    # Get two-axis contrastive parameters
-    num_songs = getattr(args, 'num_songs_per_batch', 8)
-    num_variants = getattr(args, 'num_mix_variants', 3)
-    num_segments = getattr(args, 'num_segments', 2)
+    # Get baseline parameters
+    num_segments = getattr(args, 'num_segments', 2)  # Number of clips per song for positives
 
     # Create full dataset
-    full_dataset = FMAContrastiveDataset(
-        data_path=args.data_path,
+    full_dataset = FMABaselineDataset(
         separated_path=separated_path,
-        use_preseparated=use_preseparated,
-        scnet_separator=scnet_separator,
         clip_duration=args.clip_duration,
         sample_rate=args.sample_rate,
         n_fft=args.n_fft,
         hop_length=args.hop_length,
         n_mels=args.n_mels,
-        augment_prob=args.aug_prob,
-        gain_range=args.aug_gain_range,
-        num_songs_per_batch=num_songs,
-        num_mix_variants=num_variants,
-        num_segments=num_segments
+        num_segments=num_segments,
+        min_audio_duration=25.0
     )
-    print(f"Full dataset created with {len(full_dataset)} samples")
-    print(f"Two-axis structure: S={num_songs} songs × V={num_variants} variants × T={num_segments} segments")
-    print(f"Effective batch size per batch: {num_songs} songs → {num_songs * num_variants * num_segments} items")
+    print(f"Full dataset created with {len(full_dataset)} tracks")
+    print(f"Baseline structure: {num_segments} temporal segments per song")
+    print(f"Effective batch size per batch: batch_size × {num_segments} segments")
 
     # Split dataset into train (90%) and validation (10%)
     dataset_size = len(full_dataset)
@@ -295,7 +253,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=collate_fn,
+        collate_fn=baseline_collate_fn,
         pin_memory=False,
         prefetch_factor=2 if args.num_workers > 0 else None,
         persistent_workers=False,
@@ -308,7 +266,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,  # No need to shuffle validation
         num_workers=args.num_workers,
-        collate_fn=collate_fn,
+        collate_fn=baseline_collate_fn,
         pin_memory=False,
         prefetch_factor=2 if args.num_workers > 0 else None,
         persistent_workers=False,
@@ -316,7 +274,7 @@ def main():
     )
 
     # Get feature dimension from dataset
-    stems_list, features_list, song_idx, variant_idxs, segment_idxs = full_dataset[0]
+    stems_list, features_list, song_idx = full_dataset[0]
     feature_dim = features_list[0].shape[0]  # First item's feature dimension
     print(f"Mixing feature dimension: {feature_dim}")
 
@@ -372,19 +330,11 @@ def main():
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-    # Initialize loss function based on mode
-    if num_variants == 1:
-        # Baseline mode: simple InfoNCE (same song = positive, different song = negative)
-        criterion = InfoNCELoss(temperature=args.temperature)
-        print(f"Baseline mode: Using InfoNCELoss with temperature={args.temperature}")
-        print("  Positives: Same song, different temporal clips")
-        print("  Negatives: Different songs")
-    else:
-        # Two-axis mode: complex InfoNCE with mixing discrimination
-        criterion = TwoAxisInfoNCELoss(temperature=args.temperature)
-        print(f"Two-axis mode: Using TwoAxisInfoNCELoss with temperature={args.temperature}")
-        print("  Positives: Same song + same variant, different segments")
-        print("  Negatives: Different variants + different songs")
+    # Initialize InfoNCE loss function
+    criterion = InfoNCELoss(temperature=args.temperature)
+    print(f"Using InfoNCELoss with temperature={args.temperature}")
+    print("  Positives: Same song, different temporal segments")
+    print("  Negatives: Different songs")
 
     # Initialize mixed precision training (AMP) for VRAM reduction
     use_amp = getattr(args, 'use_amp', False) and device.type == 'cuda'

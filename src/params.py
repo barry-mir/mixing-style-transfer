@@ -12,10 +12,6 @@ def get_params():
     )
 
     # Dataset parameters
-    parser.add_argument('--data_path', type=str, default='/nas/FMA/fma_full/',
-                        help='Path to FMA dataset')
-    parser.add_argument('--use_preseparated', action='store_true', default=True,
-                        help='Use pre-separated stems (recommended to save VRAM)')
     parser.add_argument('--separated_path', type=str, default='/nas/FMA/fma_separated/',
                         help='Path to pre-separated stems directory')
     parser.add_argument('--sample_rate', type=int, default=44100,
@@ -24,14 +20,6 @@ def get_params():
                         help='Duration of audio clips in seconds')
     parser.add_argument('--num_workers', type=int, default=4,
                         help='Number of data loading workers')
-
-    # SCNet source separation parameters
-    parser.add_argument('--scnet_model_path', type=str,
-                        default='Music-Source-Separation-Training/model_scnet_masked_ep_111_sdr_9.8286.ckpt',
-                        help='Path to SCNet checkpoint')
-    parser.add_argument('--scnet_config_path', type=str,
-                        default='Music-Source-Separation-Training/configs/config_musdb18_scnet_xl_ihf.yaml',
-                        help='Path to SCNet config')
 
     # Audio preprocessing
     parser.add_argument('--n_fft', type=int, default=1024,
@@ -64,18 +52,8 @@ def get_params():
     # Contrastive learning parameters
     parser.add_argument('--temperature', type=float, default=0.1,
                         help='Temperature for InfoNCE loss')
-    parser.add_argument('--num_songs_per_batch', type=int, default=8,
-                        help='S: Number of songs per batch')
-    parser.add_argument('--num_mix_variants', type=int, default=3,
-                        help='V: Number of mix variants per song')
     parser.add_argument('--num_segments', type=int, default=2,
-                        help='T: Number of temporal segments per variant')
-
-    # Augmentation parameters
-    parser.add_argument('--aug_gain_range', type=float, default=9.0,
-                        help='Gain augmentation range in dB (±)')
-    parser.add_argument('--aug_prob', type=float, default=0.5,
-                        help='Probability of applying each augmentation')
+                        help='Number of temporal segments per song (for positive pairs)')
 
     # Logging and checkpointing
     parser.add_argument('--log_interval', type=int, default=10,

@@ -24,12 +24,12 @@
 #     exit 1
 # fi
 
-OPTIMIZE_TARGET="embeddings"
+OPTIMIZE_TARGET="features"
 INPUT_AUDIO="../assets/song_A.wav"
 TARGET_AUDIO="../assets/song_B.wav"
-OUTPUT_DIR="../outputs/test_emb_0121"
-NUM_STEPS=500
-LR=0.001
+OUTPUT_DIR="../outputs/test_0122"
+NUM_STEPS=10000
+LR=0.0001
 SEGMENT_DURATION=10.0
 SEGMENT_OFFSET=0.0
 
@@ -46,19 +46,36 @@ echo "Segment: ${SEGMENT_DURATION}s (offset: ${SEGMENT_OFFSET}s)"
 echo "=========================================="
 echo ""
 
-# Run inference on GPU 1
 # Note: Audio is segmented to 10s by default (encoder trained on 10s clips)
-CUDA_VISIBLE_DEVICES=1 python ../inference/inference_e2e_style_transfer.py \
+python ../inference/inference_e2e_style_transfer.py \
     --input_audio "$INPUT_AUDIO" \
     --target_audio "$TARGET_AUDIO" \
-    --optimize_target "$OPTIMIZE_TARGET" \
-    --output_dir "$OUTPUT_DIR" \
+    --optimize_target embeddings \
+    --output_dir "${OUTPUT_DIR}_embeddings" \
     --num_steps "$NUM_STEPS" \
     --lr "$LR" \
     --receptive_field 2.0 \
     --segment_duration "$SEGMENT_DURATION" \
     --segment_offset "$SEGMENT_OFFSET" \
-    --device cuda
+    --device cuda \
+    --use_cycle_consistency \
+    --lambda_recon 1.0 \
+    --lambda_waveform 1.0
+
+python ../inference/inference_e2e_style_transfer.py \
+    --input_audio "$INPUT_AUDIO" \
+    --target_audio "$TARGET_AUDIO" \
+    --optimize_target features \
+    --output_dir "${OUTPUT_DIR}_features" \
+    --num_steps "$NUM_STEPS" \
+    --lr "$LR" \
+    --receptive_field 2.0 \
+    --segment_duration "$SEGMENT_DURATION" \
+    --segment_offset "$SEGMENT_OFFSET" \
+    --device cuda \
+    --use_cycle_consistency \
+    --lambda_recon 1.0 \
+    --lambda_waveform 1.0
 
 echo ""
 echo "Done! Results saved to: $OUTPUT_DIR"

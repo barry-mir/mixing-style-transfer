@@ -137,182 +137,6 @@ class InfoNCELoss(nn.Module):
         return loss
 
 
-class ContrastiveLossSimple(nn.Module):
-    """
-    Simplified contrastive loss for pairs.
-
-    This version assumes the batch is organized as:
-    [anchor_1, positive_1, negative_1, anchor_2, positive_2, negative_2, ...]
-
-    Where:
-    - anchor_i and positive_i are from the same song (different clips)
-    - anchor_i and negative_i are the same clip (augmented)
-    """
-
-    def __init__(self, temperature=0.1):
-        super().__init__()
-        self.temperature = temperature
-
-    def forward(self, embeddings):
-        """
-        Compute contrastive loss assuming batch structure [anchor, pos, neg, ...].
-
-        Args:
-            embeddings: Tensor of shape (3*N, D) where N is number of triplets
-
-        Returns:
-            loss: Scalar contrastive loss
-        """
-        batch_size = embeddings.shape[0]
-        assert batch_size % 3 == 0, "Batch size must be multiple of 3 (anchor, pos, neg)"
-
-        # Normalize embeddings
-        embeddings = F.normalize(embeddings, dim=1)
-
-        # Reshape into triplets
-        embeddings = embeddings.view(-1, 3, embeddings.shape[1])  # (N, 3, D)
-        anchors = embeddings[:, 0, :]  # (N, D)
-        positives = embeddings[:, 1, :]  # (N, D)
-        negatives = embeddings[:, 2, :]  # (N, D)
-
-        # Compute similarities
-        pos_sim = torch.sum(anchors * positives, dim=1) / self.temperature  # (N,)
-        neg_sim = torch.sum(anchors * negatives, dim=1) / self.temperature  # (N,)
-
-        # InfoNCE loss: -log(exp(pos_sim) / (exp(pos_sim) + exp(neg_sim)))
-        loss = -torch.log(
-            torch.exp(pos_sim) / (torch.exp(pos_sim) + torch.exp(neg_sim) + 1e-8)
-        )
-
-        return loss.mean()
-
-
-class TwoAxisInfoNCELoss(nn.Module):
-    """
-    Two-axis InfoNCE loss for mixing style representation learning.
-
-    Correct structure:
-    - Axis 1 (Content invariance): Same song, same variant, different segments → POSITIVE
-      (Mixing style is shared across the whole song)
-    - Axis 2 (Mixing sensitivity): Same song, different variants → NEGATIVE
-      (Different mixes should have different representations)
-    - Hard negatives: Different songs → NEGATIVE
-
-    This encourages:
-    - Content-invariant representations within same mix (temporal segments are similar)
-    - Mixing-sensitive representations (different mixes have different embeddings)
-    """
-
-    def __init__(self, temperature=0.1):
-        """
-        Args:
-            temperature: Temperature parameter for scaling similarities
-        """
-        super().__init__()
-        self.temperature = temperature
-
-    def forward(self, embeddings, song_labels, variant_labels, segment_labels):
-        """
-        Compute two-axis InfoNCE loss.
-
-        Args:
-            embeddings: (N, D) where N = S×V×T (songs × variants × segments)
-            song_labels: (N,) - song index for each embedding
-            variant_labels: (N,) - variant index within song
-            segment_labels: (N,) - segment index within variant
-
-        Returns:
-            loss: Scalar contrastive loss
-        """
-        batch_size = embeddings.shape[0]
-        device = embeddings.device
-
-        # Check embeddings for NaN/inf
-        if torch.isnan(embeddings).any():
-            print(f"[TwoAxisInfoNCELoss] NaN in embeddings before normalization!")
-        if torch.isinf(embeddings).any():
-            print(f"[TwoAxisInfoNCELoss] Inf in embeddings before normalization!")
-
-        # Normalize embeddings
-        embeddings = F.normalize(embeddings, dim=1)
-
-        if torch.isnan(embeddings).any():
-            print(f"[TwoAxisInfoNCELoss] NaN in embeddings after normalization!")
-
-        # Compute similarity matrix (N, N)
-        similarity_matrix = torch.matmul(embeddings, embeddings.T) / self.temperature
-
-        if torch.isnan(similarity_matrix).any():
-            print(f"[TwoAxisInfoNCELoss] NaN in similarity_matrix!")
-        if torch.isinf(similarity_matrix).any():
-            print(f"[TwoAxisInfoNCELoss] Inf in similarity_matrix! Max: {similarity_matrix.max()}, Min: {similarity_matrix.min()}")
-
-        # Create masks for different relationships
-        song_labels = song_labels.unsqueeze(1)  # (N, 1)
-        variant_labels = variant_labels.unsqueeze(1)  # (N, 1)
-
-        # Axis 1: Same song + same variant (different segments only) → POSITIVE
-        # This captures content invariance - all segments of same mix should be similar
-        mask_same_song = (song_labels == song_labels.T).float()  # (N, N)
-        mask_same_variant = (variant_labels == variant_labels.T).float()  # (N, N)
-        mask_positive = mask_same_song * mask_same_variant  # Same song AND same variant
-        mask_positive.fill_diagonal_(0)  # Exclude self-similarity
-
-        # Axis 2: Same song + different variant → NEGATIVE (for mixing discrimination)
-        # These are the key negatives that enforce mixing sensitivity
-        mask_diff_variant = (song_labels == song_labels.T) & (variant_labels != variant_labels.T)
-        mask_diff_variant = mask_diff_variant.float()  # (N, N)
-
-        # Hard negatives: Different songs
-        mask_diff_song = (song_labels != song_labels.T).float()  # (N, N)
-
-        # All negatives: different variants of same song + different songs
-        mask_negative = mask_diff_variant + mask_diff_song  # (N, N)
-
-        # Exp of similarities for numerical stability
-        max_similarity = torch.max(similarity_matrix, dim=1, keepdim=True)[0]
-        similarity_matrix_centered = similarity_matrix - max_similarity
-
-        if torch.isnan(similarity_matrix_centered).any() or torch.isinf(similarity_matrix_centered).any():
-            print(f"[TwoAxisInfoNCELoss] similarity_matrix_centered has NaN/Inf!")
-
-        similarity_matrix_exp = torch.exp(similarity_matrix_centered)
-
-        if torch.isnan(similarity_matrix_exp).any() or torch.isinf(similarity_matrix_exp).any():
-            print(f"[TwoAxisInfoNCELoss] similarity_matrix_exp has NaN/Inf AFTER exp!")
-            print(f"  NaN count: {torch.isnan(similarity_matrix_exp).sum()}")
-            print(f"  Inf count: {torch.isinf(similarity_matrix_exp).sum()}")
-            print(f"  Input to exp range: [{similarity_matrix_centered.min()}, {similarity_matrix_centered.max()}]")
-
-        # Compute InfoNCE loss
-        losses = []
-        for i in range(batch_size):
-            # Positive similarities: same song, same variant, different segments
-            pos_sim = similarity_matrix_exp[i] * mask_positive[i]
-            pos_sum = pos_sim.sum()
-
-            # Negative similarities: different variants + different songs
-            neg_sim = similarity_matrix_exp[i] * mask_negative[i]
-            neg_sum = neg_sim.sum()
-
-            # InfoNCE loss
-            if pos_sum > 0:  # Only if positives exist
-                loss_i = -torch.log(pos_sum / (pos_sum + neg_sum + 1e-8))
-                losses.append(loss_i)
-
-        # Average over batch
-        if len(losses) == 0:
-            raise RuntimeError(
-                f"No positive pairs found in batch! "
-                f"Batch size: {batch_size}, "
-                f"Unique (song, variant) pairs: {len(torch.unique(torch.stack([song_labels.squeeze(), variant_labels.squeeze()], dim=1), dim=0))}, "
-                f"num_segments should be ≥2 to create positives within same variant."
-            )
-
-        loss = torch.stack(losses).mean()
-        return loss
-
-
 class NTXentLoss(nn.Module):
     """
     NT-Xent (Normalized Temperature-scaled Cross Entropy) loss.
@@ -362,3 +186,145 @@ class NTXentLoss(nn.Module):
         loss = F.cross_entropy(sim_matrix, labels)
 
         return loss
+
+
+class UncertaintyWeightedMSELoss(nn.Module):
+    """
+    Uncertainty-weighted MSE loss for mixing features with different scales.
+
+    Based on "Multi-Task Learning Using Uncertainty to Weigh Losses for Scene
+    Geometry and Semantics" (Kendall et al., 2017).
+
+    The loss formula per feature group:
+        L = Σ(L_i / (2σ_i²)) + log(σ_i)
+
+    where:
+    - L_i is the MSE loss for feature group i
+    - σ_i is a learned uncertainty parameter (automatically balances scales)
+    - log(σ_i) prevents trivial solution σ → ∞
+
+    Feature groups (default 56 features):
+    - Dynamics: 24 features (4 stems × 6) - RMS, crest factor, loudness per stem
+    - Spectral: 20 features (4 stems × 5) - Band energies, tilt, flatness per stem
+    - Stereo: 12 features (4 stems × 3) - ILD, correlation, mid-side ratio per stem
+
+    With detailed spectral (e.g., 32 bins):
+    - Dynamics: 24 features (4 stems × 6)
+    - Spectral: 136 features (4 stems × 34) - 32 freq bins + tilt + flatness
+    - Stereo: 12 features (4 stems × 3)
+
+    Feature scales (before weighting):
+    - Dynamics: -60 to +10 dB
+    - Spectral: -100 to 0 dB
+    - Stereo: -40 to +40 dB / -1 to +1
+    """
+
+    def __init__(
+        self,
+        num_feature_groups=4,
+        dynamics_dim_per_stem=6,
+        spectral_dim_per_stem=5,
+        stereo_dim_per_stem=3,
+        global_dim=8
+    ):
+        """
+        Args:
+            num_feature_groups: Number of feature groups (default: 4)
+            dynamics_dim_per_stem: Dynamics features per stem (default: 6)
+            spectral_dim_per_stem: Spectral features per stem (default: 5 for old, 34 for new with 32 bins)
+            stereo_dim_per_stem: Stereo features per stem (default: 3)
+            global_dim: Global/relational features (default: 8 for 4 rel_loudness + 4 masking)
+        """
+        super().__init__()
+
+        # Learnable log-variance parameters (one per feature group)
+        # Initialize to 0 (σ = 1) for all groups
+        self.log_sigma = nn.Parameter(torch.zeros(num_feature_groups))
+
+        # Calculate feature group indices dynamically
+        # 4 stems in order: vocals, bass, drums, other
+        dynamics_total = 4 * dynamics_dim_per_stem
+        spectral_total = 4 * spectral_dim_per_stem
+        stereo_total = 4 * stereo_dim_per_stem
+
+        self.group_indices = {
+            'dynamics': list(range(0, dynamics_total)),
+            'spectral': list(range(dynamics_total, dynamics_total + spectral_total)),
+            'stereo': list(range(dynamics_total + spectral_total, dynamics_total + spectral_total + stereo_total)),
+            'global': list(range(dynamics_total + spectral_total + stereo_total,
+                                dynamics_total + spectral_total + stereo_total + global_dim)),
+        }
+
+        self.num_groups = num_feature_groups
+        self.total_features = dynamics_total + spectral_total + stereo_total + global_dim
+
+        assert num_feature_groups == len(self.group_indices), \
+            f"num_feature_groups ({num_feature_groups}) must match number of feature groups ({len(self.group_indices)})"
+
+        print(f"[UncertaintyWeightedMSELoss] Initialized with:")
+        print(f"  Dynamics: indices {self.group_indices['dynamics'][0]}-{self.group_indices['dynamics'][-1]} ({dynamics_total} features)")
+        print(f"  Spectral: indices {self.group_indices['spectral'][0]}-{self.group_indices['spectral'][-1]} ({spectral_total} features)")
+        print(f"  Stereo: indices {self.group_indices['stereo'][0]}-{self.group_indices['stereo'][-1]} ({stereo_total} features)")
+        print(f"  Global: indices {self.group_indices['global'][0]}-{self.group_indices['global'][-1]} ({global_dim} features)")
+        print(f"  Total features: {self.total_features}")
+
+    def forward(self, pred_features, target_features):
+        """
+        Compute uncertainty-weighted MSE loss.
+
+        Args:
+            pred_features: (B, total_features) predicted mixing features
+            target_features: (B, total_features) target mixing features
+
+        Returns:
+            loss: Scalar uncertainty-weighted loss
+            loss_dict: Dict with per-group losses and uncertainties for logging
+        """
+        # Validate input shapes
+        if pred_features.shape[-1] != self.total_features:
+            raise ValueError(f"Expected {self.total_features} features, got {pred_features.shape[-1]}")
+        if target_features.shape[-1] != self.total_features:
+            raise ValueError(f"Expected {self.total_features} features, got {target_features.shape[-1]}")
+
+        # Convert log_sigma to sigma
+        sigma = torch.exp(self.log_sigma)  # (num_groups,)
+
+        total_loss = 0.0
+        loss_dict = {}
+
+        # Compute weighted loss for each feature group
+        for group_idx, (group_name, indices) in enumerate(self.group_indices.items()):
+            # Extract features for this group
+            group_pred = pred_features[:, indices]       # (B, num_features_in_group)
+            group_target = target_features[:, indices]   # (B, num_features_in_group)
+
+            # Compute MSE for this group
+            group_mse = F.mse_loss(group_pred, group_target, reduction='mean')
+
+            # Apply uncertainty weighting: L / (2*sigma^2) + log(sigma)
+            weighted_loss = group_mse / (2 * sigma[group_idx]**2) + self.log_sigma[group_idx]
+
+            total_loss += weighted_loss
+
+            # Store for logging
+            loss_dict[f'{group_name}_mse'] = group_mse.item()
+            loss_dict[f'{group_name}_sigma'] = sigma[group_idx].item()
+            loss_dict[f'{group_name}_weighted'] = weighted_loss.item()
+
+        # Store overall uncertainty parameters
+        loss_dict['total_loss'] = total_loss.item()
+
+        return total_loss, loss_dict
+
+    def get_uncertainties(self):
+        """
+        Get current uncertainty parameters for each feature group.
+
+        Returns:
+            Dict mapping group names to sigma values
+        """
+        sigma = torch.exp(self.log_sigma)
+        return {
+            group_name: sigma[i].item()
+            for i, group_name in enumerate(self.group_indices.keys())
+        }

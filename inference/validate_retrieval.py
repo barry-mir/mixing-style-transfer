@@ -21,7 +21,7 @@ import soundfile as sf
 sys.path.append(str(Path(__file__).parent.parent / 'src'))
 
 from model import MixingStyleEncoder
-from data import FMAContrastiveDataset, SCNetSeparator
+from data import FMABaselineDataset, SCNetSeparator
 from mixing_utils import MixingFeatureExtractor
 from validation_utils import (
     compute_track_embedding,
@@ -66,7 +66,7 @@ def validate_in_domain(model, dataset, val_indices, feature_extractor, scnet, de
 
     Args:
         model: Trained model
-        dataset: FMAContrastiveDataset
+        dataset: FMABaselineDataset
         val_indices: List of validation indices
         feature_extractor: MixingFeatureExtractor
         scnet: SCNetSeparator
@@ -173,7 +173,7 @@ def validate_out_of_domain(model, dataset, train_val_indices, feature_extractor,
 
     Args:
         model: Trained model
-        dataset: FMAContrastiveDataset
+        dataset: FMABaselineDataset
         train_val_indices: List of all train+val indices
         feature_extractor: MixingFeatureExtractor
         scnet: SCNetSeparator
@@ -369,21 +369,15 @@ def main():
 
     # Create dataset
     print("\nLoading dataset...")
-    dataset = FMAContrastiveDataset(
-        data_path=args.data_path,
+    dataset = FMABaselineDataset(
         separated_path=args.separated_path,
-        use_preseparated=True,
-        scnet_separator=None,  # Not needed since using pre-separated
         clip_duration=10.0,
         sample_rate=44100,
         n_fft=1024,
         hop_length=256,
         n_mels=128,
-        augment_prob=0.0,  # No augmentation for validation
-        gain_range=0.0,
-        num_songs_per_batch=1,
-        num_mix_variants=1,
-        num_segments=1
+        num_segments=1,  # Just need one clip per song for validation
+        min_audio_duration=10.0
     )
     print(f"Dataset loaded: {len(dataset)} tracks")
 
