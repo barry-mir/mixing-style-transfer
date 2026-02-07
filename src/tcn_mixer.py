@@ -168,13 +168,13 @@ class TCNFiLMGenerator(nn.Module):
 
         # Larger MLP for larger output dimension
         self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, 1024),
+            nn.Linear(embed_dim, 512),
             nn.LeakyReLU(0.2),
             nn.Dropout(0.1),
-            nn.Linear(1024, 1024),
+            nn.Linear(512, 512),
             nn.LeakyReLU(0.2),
             nn.Dropout(0.1),
-            nn.Linear(1024, output_dim)
+            nn.Linear(512, output_dim)
         )
 
         # Initialize to small values for stable start

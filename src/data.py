@@ -22,7 +22,7 @@ from utils.model_utils import demix, load_start_checkpoint
 from utils.audio_utils import normalize_audio, denormalize_audio
 
 # Import from local mixing_utils (renamed to avoid conflict with SCNet utils)
-from mixing_utils import MixingFeatureExtractor, AudioAugmenter
+from mixing_utils import MixingFeatureExtractor
 
 
 class SCNetSeparator:
@@ -160,26 +160,8 @@ class FMABaselineDataset(Dataset):
             if os.path.isdir(d)
         ]
 
-        # Filter by duration
-        self.track_dirs = self._filter_by_duration()
-
-        print(f"Found {len(self.track_dirs)} tracks with duration >= {min_audio_duration}s")
-
         # Initialize feature extractor
         self.feature_extractor = MixingFeatureExtractor(sample_rate, n_fft, hop_length, n_mels)
-
-    def _filter_by_duration(self):
-        """Filter tracks by minimum duration."""
-        valid_tracks = []
-        for track_dir in self.track_dirs:
-            # Check vocals duration as proxy
-            vocals_path = os.path.join(track_dir, 'vocals.wav')
-            if os.path.exists(vocals_path):
-                info = torchaudio.info(vocals_path)
-                duration = info.num_frames / info.sample_rate
-                if duration >= self.min_duration:
-                    valid_tracks.append(track_dir)
-        return valid_tracks
 
     def __len__(self):
         return len(self.track_dirs)
@@ -205,95 +187,109 @@ class FMABaselineDataset(Dataset):
         """Load all stems for a track."""
         stems = {}
         for stem_name in ['vocals', 'bass', 'drums', 'other']:
-            stem_path = os.path.join(track_dir, f'{stem_name}.wav')
-            if os.path.exists(stem_path):
-                stems[stem_name] = self._load_single_stem(stem_path)
-            else:
-                # Silent stem if missing
-                stems[stem_name] = torch.zeros(2, self.clip_samples)
+            stem_path = os.path.join(track_dir, f'{stem_name}.mp3')
+            if not os.path.exists(stem_path):
+                raise FileNotFoundError(
+                    f"Stem file not found: {stem_path}\n"
+                    f"Track directory: {track_dir}\n"
+                    f"This indicates the pre-separated stems are missing or in wrong format."
+                )
+            stems[stem_name] = self._load_single_stem(stem_path)
 
         return stems
-
-    def _extract_random_clips(self, stems, num_clips):
-        """Extract random non-overlapping clips from stems."""
-        # Get audio length (use vocals as reference)
-        audio_length = stems['vocals'].shape[1]
-
-        # Calculate valid start positions (avoid overlap)
-        max_start = audio_length - self.clip_samples
-        if max_start <= 0:
-            # Audio too short, pad
-            clips = []
-            for _ in range(num_clips):
-                clip = {}
-                for stem_name, stem_audio in stems.items():
-                    if stem_audio.shape[1] < self.clip_samples:
-                        pad_length = self.clip_samples - stem_audio.shape[1]
-                        stem_audio = torch.nn.functional.pad(stem_audio, (0, pad_length))
-                    clip[stem_name] = stem_audio[:, :self.clip_samples]
-                clips.append(clip)
-            return clips
-
-        # Sample non-overlapping start positions
-        min_gap = self.clip_samples  # Minimum gap between clips
-        starts = []
-        for _ in range(num_clips):
-            valid_starts = list(range(0, max_start, min_gap))
-            # Filter out starts too close to existing ones
-            for existing_start in starts:
-                valid_starts = [s for s in valid_starts
-                               if abs(s - existing_start) >= min_gap]
-            if valid_starts:
-                start = np.random.choice(valid_starts)
-                starts.append(start)
-            else:
-                # Fallback: random start
-                start = np.random.randint(0, max_start)
-                starts.append(start)
-
-        # Extract clips
-        clips = []
-        for start in starts:
-            clip = {}
-            for stem_name, stem_audio in stems.items():
-                clip[stem_name] = stem_audio[:, start:start + self.clip_samples]
-            clips.append(clip)
-
-        return clips
 
     def __getitem__(self, idx):
         """
         Returns multiple temporal segments from the same song.
 
         Returns:
-            Tuple of (stems_list, features_list, song_idx):
+            Tuple of (stems_list, features_list, song_idx, track_dir):
             - stems_list: List of num_segments stem dicts
             - features_list: List of num_segments feature vectors
             - song_idx: Song index (for contrastive learning)
+            - track_dir: Track directory path (for song identity cache lookup)
         """
         track_dir = self.track_dirs[idx]
 
         # Load all stems
         stems_full = self._load_stems(track_dir)
 
-        # Extract multiple random clips (temporal segments)
-        clips = self._extract_random_clips(stems_full, self.num_segments)
-
-        # Extract features for each clip
+        audio_length = stems_full['vocals'].shape[1]
         stems_list = []
         features_list = []
 
-        for clip_stems in clips:
-            # Compute mixture
-            mixture = sum(clip_stems.values())  # (2, T)
+        # Extract non-overlapping clips
+        if self.num_segments == 1:
+            # Single clip - just random crop
+            max_start = audio_length - self.clip_samples
+            if max_start <= 0:
+                start_idx = 0
+            else:
+                start_idx = np.random.randint(0, max_start + 1)
 
-            # Extract mixing features
+            clip_stems = self._extract_clip(stems_full, start_idx, audio_length)
+            mixture = sum(clip_stems.values())
             features = self.feature_extractor.extract_all_features(clip_stems, mixture)
-
             stems_list.append(clip_stems)
             features_list.append(features)
 
-        return stems_list, features_list, idx  # idx is the song label
+        elif self.num_segments == 2:
+            # Two non-overlapping clips with your logic
+            # First clip: random from [0, audio_len - 2*clip_len]
+            # Second clip: random from [start1 + clip_len, audio_len - clip_len]
+
+            min_required_length = 2 * self.clip_samples
+            if audio_length < min_required_length:
+                # Audio too short for 2 non-overlapping clips, just repeat same clip twice
+                start_idx = 0
+                for _ in range(2):
+                    clip_stems = self._extract_clip(stems_full, start_idx, audio_length)
+                    mixture = sum(clip_stems.values())
+                    features = self.feature_extractor.extract_all_features(clip_stems, mixture)
+                    stems_list.append(clip_stems)
+                    features_list.append(features)
+            else:
+                # First clip
+                max_start1 = audio_length - 2 * self.clip_samples
+                start1 = np.random.randint(0, max_start1 + 1)
+
+                clip_stems1 = self._extract_clip(stems_full, start1, audio_length)
+                mixture1 = sum(clip_stems1.values())
+                features1 = self.feature_extractor.extract_all_features(clip_stems1, mixture1)
+                stems_list.append(clip_stems1)
+                features_list.append(features1)
+
+                # Second clip (non-overlapping with first)
+                min_start2 = start1 + self.clip_samples
+                max_start2 = audio_length - self.clip_samples
+                start2 = np.random.randint(min_start2, max_start2 + 1)
+
+                clip_stems2 = self._extract_clip(stems_full, start2, audio_length)
+                mixture2 = sum(clip_stems2.values())
+                features2 = self.feature_extractor.extract_all_features(clip_stems2, mixture2)
+                stems_list.append(clip_stems2)
+                features_list.append(features2)
+        else:
+            raise ValueError(
+                f"num_segments={self.num_segments} is not supported. "
+                f"Only num_segments=1 or num_segments=2 are implemented."
+            )
+
+        return stems_list, features_list, idx, track_dir
+
+    def _extract_clip(self, stems_full, start_idx, audio_length):
+        """Extract a single clip from stems at given start position."""
+        clip_stems = {}
+        for stem_name, stem_audio in stems_full.items():
+            if start_idx + self.clip_samples <= audio_length:
+                # Normal extraction
+                clip_stems[stem_name] = stem_audio[:, start_idx:start_idx + self.clip_samples]
+            else:
+                # Need padding
+                available = stem_audio[:, start_idx:]
+                pad_length = self.clip_samples - available.shape[1]
+                clip_stems[stem_name] = torch.nn.functional.pad(available, (0, pad_length))
+        return clip_stems
 
 
 def baseline_collate_fn(batch):
@@ -301,24 +297,27 @@ def baseline_collate_fn(batch):
     Collate function for baseline InfoNCE dataset.
 
     Args:
-        batch: List of (stems_list, features_list, song_idx) tuples
+        batch: List of (stems_list, features_list, song_idx, track_dir) tuples
 
     Returns:
-        Tuple of (stems_dict, features, song_labels):
+        Tuple of (stems_dict, features, song_labels, track_dirs):
         - stems_dict: Dict with keys ['vocals', 'bass', 'drums', 'other']
                      Each value is (N, 2, T) where N = batch_size * num_segments
         - features: (N, feature_dim)
         - song_labels: (N,) - song index for each segment
+        - track_dirs: List of N track directory paths (for cache lookup)
     """
     all_stems_list = []
     all_features = []
     all_song_labels = []
+    all_track_dirs = []
 
-    for stems_list, features_list, song_idx in batch:
+    for stems_list, features_list, song_idx, track_dir in batch:
         for stems, features in zip(stems_list, features_list):
             all_stems_list.append(stems)
             all_features.append(features)
             all_song_labels.append(song_idx)
+            all_track_dirs.append(track_dir)  # Same track_dir for all segments of this song
 
     # Stack all stems
     stems_dict = {}
@@ -330,7 +329,7 @@ def baseline_collate_fn(batch):
     features = torch.stack(all_features, dim=0)  # (N, feature_dim)
     song_labels = torch.tensor(all_song_labels, dtype=torch.long)  # (N,)
 
-    return stems_dict, features, song_labels
+    return stems_dict, features, song_labels, all_track_dirs
 
 
 
@@ -339,14 +338,11 @@ class StyleTransferDataset(Dataset):
     Dataset for zero-shot mixing style transfer training.
 
     Creates pairs of (input_stems, target_stems, target_features) where:
-    - input_stems: Original separated stems
-    - target_stems: Augmented version with different mixing style
+    - input_stems: Original stems from one song (to be style transferred)
+    - target_stems: Stems from a DIFFERENT song (with the target mixing style)
     - target_features: Pre-computed mixing features of target_stems
 
-    Augmentation strategies:
-    - Stem-level gain adjustments (±6dB per stem)
-    - Relative loudness changes (boost vocals, reduce bass, etc.)
-    - Creates diverse mixing styles from same audio content
+    Each sample loads two independent songs to learn cross-song style transfer.
     """
 
     def __init__(
@@ -360,8 +356,6 @@ class StyleTransferDataset(Dataset):
         n_fft=1024,
         hop_length=256,
         n_mels=128,
-        augment_prob=1.0,  # Always augment for style transfer
-        gain_range=6.0,    # ±6dB gain range for creating mixing variations
         use_detailed_spectral=False,
         n_spectral_bins=32,
     ):
@@ -376,8 +370,6 @@ class StyleTransferDataset(Dataset):
             n_fft: FFT size
             hop_length: Hop length for STFT
             n_mels: Number of mel bands
-            augment_prob: Probability of applying augmentations (default: 1.0)
-            gain_range: Gain augmentation range in dB (default: ±6dB)
             use_detailed_spectral: If True, use detailed frequency curve
             n_spectral_bins: Number of spectral bins for detailed spectral
         """
@@ -412,7 +404,7 @@ class StyleTransferDataset(Dataset):
             if scnet_separator is None:
                 raise ValueError("scnet_separator required when use_preseparated=False")
 
-        # Initialize feature extractor and augmenter
+        # Initialize feature extractor
         self.feature_extractor = MixingFeatureExtractor(
             sample_rate=sample_rate,
             n_fft=n_fft,
@@ -421,7 +413,6 @@ class StyleTransferDataset(Dataset):
             use_detailed_spectral=use_detailed_spectral,
             n_spectral_bins=n_spectral_bins
         )
-        self.augmenter = AudioAugmenter(sample_rate, gain_range, augment_prob)
 
     def __len__(self):
         if self.use_preseparated:
@@ -460,20 +451,11 @@ class StyleTransferDataset(Dataset):
         }
 
         # Check all files exist
+        stems_dict = {}
         for stem_name, stem_path in stem_paths.items():
             if not os.path.exists(stem_path):
                 raise FileNotFoundError(f"Missing stem: {stem_path}")
-
-        # Load all stems in parallel
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {
-                stem_name: executor.submit(self._load_single_stem, path)
-                for stem_name, path in stem_paths.items()
-            }
-            stems_dict = {
-                stem_name: future.result()
-                for stem_name, future in futures.items()
-            }
+            stems_dict[stem_name] = self._load_single_stem(stem_path)
 
         return stems_dict
 
@@ -513,27 +495,43 @@ class StyleTransferDataset(Dataset):
         """
         Get a style transfer training sample.
 
+        Input and target are from DIFFERENT songs to learn cross-song style transfer.
+
         Returns:
             Tuple of (input_stems, target_stems, target_features):
             - input_stems: Dict with keys ['vocals', 'bass', 'drums', 'other'], values (2, T)
-            - target_stems: Augmented stems dict with same structure
+            - target_stems: Dict from a different song with same structure
             - target_features: Tensor of target mixing features (56,)
         """
+        # Load input song
         if self.use_preseparated:
-            # Load full song stems
-            track_dir = self.track_dirs[idx]
-            full_stems = self._load_preseparated_stems(track_dir)
+            input_track_dir = self.track_dirs[idx]
+            input_full_stems = self._load_preseparated_stems(input_track_dir)
         else:
-            # Load audio and separate on-the-fly
             audio_file = self.audio_files[idx]
             audio = self._load_audio(audio_file)
-            full_stems = self.scnet.separate(audio)
+            input_full_stems = self.scnet.separate(audio)
 
-        # Random crop to clip duration (10 seconds by default)
-        input_stems = self._random_crop_stems(full_stems, self.clip_samples)
+        # Random crop input to clip duration
+        input_stems = self._random_crop_stems(input_full_stems, self.clip_samples)
 
-        # Create target by augmenting stems (different mixing style)
-        target_stems = self.augmenter.augment_stems(input_stems)
+        # Sample a DIFFERENT song for target style
+        target_idx = np.random.randint(0, len(self))
+        # Ensure target is different from input
+        while target_idx == idx:
+            target_idx = np.random.randint(0, len(self))
+
+        # Load target song
+        if self.use_preseparated:
+            target_track_dir = self.track_dirs[target_idx]
+            target_full_stems = self._load_preseparated_stems(target_track_dir)
+        else:
+            target_audio_file = self.audio_files[target_idx]
+            target_audio = self._load_audio(target_audio_file)
+            target_full_stems = self.scnet.separate(target_audio)
+
+        # Random crop target to clip duration
+        target_stems = self._random_crop_stems(target_full_stems, self.clip_samples)
 
         # Compute target mixing features
         target_mixture = sum(target_stems.values())
@@ -542,7 +540,7 @@ class StyleTransferDataset(Dataset):
         )
 
         # Clean up
-        del full_stems
+        del input_full_stems, target_full_stems
 
         return input_stems, target_stems, target_features
 

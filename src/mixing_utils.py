@@ -109,12 +109,18 @@ class MixingFeatureExtractor:
 
         # RMS
         rms = torch.sqrt(torch.mean(audio ** 2, dim=-1))  # (2,)
+        # Ensure rms is 1D
+        if rms.dim() > 1:
+            rms = rms.squeeze()
         features.append(rms)
         if torch.isnan(rms).any():
             print(f"[extract_dynamics] NaN in RMS: {rms}")
 
         # Crest factor
         peak = torch.max(torch.abs(audio), dim=-1)[0]  # (2,)
+        # Ensure peak is 1D
+        if peak.dim() > 1:
+            peak = peak.squeeze()
         crest = 20 * torch.log10(peak / (rms + 1e-8))
         features.append(crest)
         if torch.isnan(crest).any():
@@ -122,7 +128,9 @@ class MixingFeatureExtractor:
 
         # Loudness (simplified LUFS approximation)
         loudness = self.compute_loudness(audio)
-        features.append(torch.tensor([loudness, loudness], device=audio.device))  # Repeat for stereo
+        # loudness is a scalar tensor, expand to (2,) for stereo
+        loudness_stereo = torch.tensor([loudness.item(), loudness.item()], device=audio.device)
+        features.append(loudness_stereo)  # Repeat for stereo
         if torch.isnan(loudness).any():
             print(f"[extract_dynamics] NaN in loudness: {loudness}")
 
@@ -324,15 +332,25 @@ class MixingFeatureExtractor:
 
         result = torch.cat(vectors)
 
-        # Clamp extreme values to prevent NaN in downstream model
+        # Clamp extreme values to prevent overflow
         # Replace inf/-inf with large finite values
         result = torch.clamp(result, min=-100.0, max=100.0)
 
-        # Final check
+        # Replace NaN with zeros (NaN can occur for silent/corrupted audio)
+        # torch.clamp doesn't handle NaN, so we must replace it explicitly
         if torch.isnan(result).any():
-            print(f"[MixingFeatureExtractor] WARNING: NaN in final features after clamping!")
+            nan_mask = torch.isnan(result)
+            nan_count = nan_mask.sum().item()
+            print(f"[MixingFeatureExtractor] WARNING: {nan_count} NaN values detected in features, replacing with 0.0")
+            print(f"  This typically indicates silent or corrupted audio")
+            result = torch.where(nan_mask, torch.zeros_like(result), result)
+
+        # Final sanity check
         if torch.isinf(result).any():
-            print(f"[MixingFeatureExtractor] WARNING: Inf in final features after clamping!")
+            raise ValueError(
+                f"Inf detected in features after clamping! This should not happen.\n"
+                f"Feature values: {result}"
+            )
 
         return result
 

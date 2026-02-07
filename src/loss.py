@@ -117,7 +117,6 @@ class InfoNCELoss(nn.Module):
             # Negative similarities for anchor i
             neg_sim = similarity_matrix_exp[i] * mask_negative[i]  # (N,)
             neg_sum = neg_sim.sum()
-            print(f"pos_sum: {pos_sum}, neg_sum: {neg_sum}, at batch index {i}")
 
             # InfoNCE loss for anchor i
             if pos_sum > 0:  # Only compute loss if there are positives
@@ -328,3 +327,122 @@ class UncertaintyWeightedMSELoss(nn.Module):
             group_name: sigma[i].item()
             for i, group_name in enumerate(self.group_indices.keys())
         }
+
+
+class MultiResolutionSTFTLoss(nn.Module):
+    """
+    Multi-resolution STFT loss for audio quality preservation.
+    Computes spectral loss at multiple FFT sizes for better perceptual quality.
+
+    Used for cycle-consistency training to ensure reconstructed audio matches input.
+    """
+
+    def __init__(self, fft_sizes=[1024, 2048, 512], hop_sizes=[256, 512, 128],
+                 win_sizes=[1024, 2048, 512], window='hann'):
+        """
+        Args:
+            fft_sizes: List of FFT sizes (default: [1024, 2048, 512])
+            hop_sizes: List of hop sizes (default: [256, 512, 128])
+            win_sizes: List of window sizes (default: [1024, 2048, 512])
+            window: Window type (default: 'hann')
+        """
+        super().__init__()
+        self.fft_sizes = fft_sizes
+        self.hop_sizes = hop_sizes
+        self.win_sizes = win_sizes
+        self.window = window
+
+    def stft(self, x, fft_size, hop_size, win_size):
+        """
+        Compute STFT.
+
+        Args:
+            x: Input audio (B, C, T) or (C, T)
+            fft_size: FFT size
+            hop_size: Hop size
+            win_size: Window size
+
+        Returns:
+            Complex STFT tensor (B*C, freq, time)
+        """
+        # x: (B, C, T) or (C, T)
+        if x.ndim == 2:
+            x = x.unsqueeze(0)  # (1, C, T)
+
+        B, C, T = x.shape
+        # Merge batch and channel for STFT
+        x_flat = x.reshape(B * C, T)  # (B*C, T)
+
+        # Create window
+        window_tensor = torch.hann_window(win_size, device=x.device)
+
+        # STFT
+        spec = torch.stft(
+            x_flat,
+            n_fft=fft_size,
+            hop_length=hop_size,
+            win_length=win_size,
+            window=window_tensor,
+            return_complex=True
+        )  # (B*C, freq, time)
+
+        return spec
+
+    def spectral_convergence(self, x_mag, y_mag):
+        """
+        Spectral convergence loss (Frobenius norm ratio).
+
+        Args:
+            x_mag: Predicted magnitude spectrogram
+            y_mag: Target magnitude spectrogram
+
+        Returns:
+            Spectral convergence loss (scalar)
+        """
+        return torch.norm(y_mag - x_mag, p='fro') / (torch.norm(y_mag, p='fro') + 1e-8)
+
+    def log_stft_magnitude(self, x_mag, y_mag):
+        """
+        Log STFT magnitude loss (L1 in log space).
+
+        Args:
+            x_mag: Predicted magnitude spectrogram
+            y_mag: Target magnitude spectrogram
+
+        Returns:
+            Log magnitude loss (scalar)
+        """
+        return nn.functional.l1_loss(torch.log(x_mag + 1e-5), torch.log(y_mag + 1e-5))
+
+    def forward(self, x, y):
+        """
+        Compute multi-resolution STFT loss.
+
+        Args:
+            x: Predicted audio (B, C, T) or (C, T)
+            y: Target audio (B, C, T) or (C, T)
+
+        Returns:
+            loss: Scalar loss value
+        """
+        total_loss = 0.0
+
+        for fft_size, hop_size, win_size in zip(self.fft_sizes, self.hop_sizes, self.win_sizes):
+            # Compute STFT
+            x_spec = self.stft(x, fft_size, hop_size, win_size)
+            y_spec = self.stft(y, fft_size, hop_size, win_size)
+
+            # Magnitude
+            x_mag = torch.abs(x_spec)
+            y_mag = torch.abs(y_spec)
+
+            # Spectral convergence + log magnitude
+            sc_loss = self.spectral_convergence(x_mag, y_mag)
+            log_mag_loss = self.log_stft_magnitude(x_mag, y_mag)
+
+            total_loss += sc_loss + log_mag_loss
+
+        # Average over resolutions
+        total_loss = total_loss / len(self.fft_sizes)
+
+        return total_loss

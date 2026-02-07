@@ -540,3 +540,48 @@ class MixingStyleEncoder(nn.Module):
             print(f"  NaN count: {torch.isnan(embedding).sum()}/{embedding.numel()}")
 
         return embedding
+
+
+class SongIdentityDiscriminator(nn.Module):
+    """
+    MLP discriminator for predicting song identity from mixing embeddings.
+
+    Used in adversarial training to encourage the mixing encoder to remove
+    song-specific content while preserving mixing style information.
+
+    Architecture: input_dim → ReLU → Dropout → hidden_dim → ReLU → Dropout → output_dim
+    """
+
+    def __init__(self, input_dim=512, hidden_dim=512, output_dim=512, dropout=0.3):
+        """
+        Initialize discriminator.
+
+        Args:
+            input_dim: Input embedding dimension (mixing embedding size)
+            hidden_dim: Hidden layer dimension
+            output_dim: Output dimension (song identity embedding size)
+            dropout: Dropout probability
+        """
+        super(SongIdentityDiscriminator, self).__init__()
+
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x):
+        """
+        Forward pass.
+
+        Args:
+            x: Input mixing embedding, shape (B, input_dim)
+
+        Returns:
+            Predicted song identity embedding, shape (B, output_dim)
+        """
+        return self.network(x)

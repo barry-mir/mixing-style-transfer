@@ -43,7 +43,7 @@ python src/train.py \
     --hop_length 512 \
     --n_mels 80 \
     --encoder_dim 512 \
-    --feature_dim 128 \
+    --feature_dim 64 \
     --band_split_size 16 \
     --band_overlap 8 \
     --num_segments 2 \
@@ -54,4 +54,4 @@ python src/train.py \
     --log_dir /nas/mixing-representation/logs_baseline_large/ \
     --device cuda \
     --seed 42 \
-    --resume /nas/mixing-representation/checkpoints_baseline_large/checkpoint_epoch_20.pt
+    --resume /nas/mixing-representation/checkpoints_baseline_large/checkpoint_epoch_35.pt

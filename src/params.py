@@ -73,9 +73,34 @@ def get_params():
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
 
+    # Adversarial training parameters
+    parser.add_argument('--use_adversarial', action='store_true', default=False,
+                        help='Enable adversarial training to remove song identity')
+    parser.add_argument('--adversarial_lambda', type=float, default=1.0,
+                        help='Final weight for adversarial loss (default: 1.0)')
+    parser.add_argument('--initial_adversarial_lambda', type=float, default=0.0,
+                        help='Initial weight for adversarial loss, ramps up to adversarial_lambda (default: 0.0)')
+    parser.add_argument('--adversarial_warmup_steps', type=int, default=2000,
+                        help='Number of steps before starting adversarial training (default: 2000)')
+    parser.add_argument('--fixed_grl_lambda', type=float, default=None,
+                        help='Fix GRL lambda to a constant value instead of using schedule (e.g., 1.0). If None, uses DANN schedule.')
+    parser.add_argument('--song_id_cache_path', type=str,
+                        default='/ssd2/barry/fma_song_identity_embeddings.pt',
+                        help='Path to pre-computed song identity embeddings cache')
+    parser.add_argument('--discriminator_hidden_dim', type=int, default=512,
+                        help='Hidden dimension for song identity discriminator (default: 512)')
+    parser.add_argument('--discriminator_dropout', type=float, default=0.3,
+                        help='Dropout probability for discriminator (default: 0.3)')
+    parser.add_argument('--discriminator_lr', type=float, default=None,
+                        help='Learning rate for discriminator. If None, uses same as encoder. Set lower (e.g., 1e-5) to weaken discriminator.')
+    parser.add_argument('--discriminator_noise', type=float, default=0.0,
+                        help='Add Gaussian noise to embeddings before discriminator (e.g., 0.01) to weaken discriminator. Default: 0.0 (no noise)')
+
     # Resume training
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
+    parser.add_argument('--weights_only', action='store_true', default=False,
+                        help='Load only model weights from checkpoint, reset training state (start from epoch 0)')
 
     args = parser.parse_args()
     return args
