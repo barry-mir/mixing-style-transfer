@@ -1,89 +1,99 @@
 #!/bin/bash
-# Helper script to run end-to-end style transfer inference
+# End-to-End Style Transfer Inference with Pretrained TCN
+# Supports both mixing_style and fx_encoder
+#
+# Usage:
+#   bash scripts/run_e2e_inference.sh <encoder_type> <tcn_checkpoint> <input.wav> <target.wav> <output_dir>
+#
+# Arguments:
+#   encoder_type: 'mixing_style' or 'fx_encoder'
+#   tcn_checkpoint: Path to trained TCN checkpoint
+#   input.wav: Path to input audio file
+#   target.wav: Path to target audio file
+#   output_dir: Output directory for results
+#
+# Examples:
+#   # MixingStyle encoder (stem-based, 512-dim)
+#   bash scripts/run_e2e_inference.sh mixing_style /path/to/tcn.pt input.wav target.wav results/test1
+#
+#   # Fx-Encoder (mixture-based, 128-dim)
+#   bash scripts/run_e2e_inference.sh fx_encoder /path/to/tcn.pt input.wav target.wav results/test2
 
-# Usage examples:
-# ./run_e2e_inference.sh embeddings input.wav target.wav output_dir
-# ./run_e2e_inference.sh features input.wav target.wav output_dir
+cd "$(dirname "$0")/.."
+export PYTHONPATH="${PYTHONPATH}:$(pwd)/src"
+export PYTHONUNBUFFERED=1
 
-# set -e
+# Parse arguments
+ENCODER_TYPE="fx_encoder"
+TCN_CHECKPOINT="/nas/mixing-representation/style_transfer/fx_encoder_plus_plus/best_model.pt"
+INPUT_AUDIO="assets/song_A.wav"
+TARGET_AUDIO="assets/song_B.wav"
+OUTPUT_DIR="outputs/test_adv_no_cycle"
 
-# if [ "$#" -lt 4 ]; then
-#     echo "Usage: $0 <optimize_target> <input_audio> <target_audio> <output_dir> [num_steps] [lr]"
-#     echo ""
-#     echo "Arguments:"
-#     echo "  optimize_target: 'embeddings' or 'features'"
-#     echo "  input_audio: Path to input audio file"
-#     echo "  target_audio: Path to target audio file"
-#     echo "  output_dir: Output directory for results"
-#     echo "  num_steps: (optional) Number of optimization steps (default: 500)"
-#     echo "  lr: (optional) Learning rate (default: 0.001)"
-#     echo ""
-#     echo "Example:"
-#     echo "  $0 embeddings /path/to/input.wav /path/to/target.wav results/test1"
-#     echo "  $0 features /path/to/input.wav /path/to/target.wav results/test2 300 0.002"
-#     exit 1
-# fi
+# Validate encoder type
+if [[ "$ENCODER_TYPE" != "mixing_style" && "$ENCODER_TYPE" != "fx_encoder" ]]; then
+    echo "Error: Invalid encoder type '$ENCODER_TYPE'"
+    echo "Must be 'mixing_style' or 'fx_encoder'"
+    exit 1
+fi
 
-OPTIMIZE_TARGET="features"
-INPUT_AUDIO="../assets/song_A.wav"
-TARGET_AUDIO="../assets/song_B.wav"
-OUTPUT_DIR="../outputs/test_0122"
-NUM_STEPS=10000
-LR=0.0001
-SEGMENT_DURATION=10.0
-SEGMENT_OFFSET=0.0
+# Check required arguments
+if [[ -z "$ENCODER_TYPE" || -z "$TCN_CHECKPOINT" || -z "$INPUT_AUDIO" || -z "$TARGET_AUDIO" ]]; then
+    echo "Usage: bash scripts/run_e2e_inference.sh <encoder_type> <tcn_checkpoint> <input.wav> <target.wav> [output_dir]"
+    echo ""
+    echo "Encoder types:"
+    echo "  mixing_style - Stem-based encoder with hand-crafted features (512-dim)"
+    echo "  fx_encoder   - Mixture-based Fx-Encoder++ (128-dim)"
+    echo ""
+    echo "Examples:"
+    echo "  bash scripts/run_e2e_inference.sh mixing_style /path/to/tcn.pt input.wav target.wav results/test1"
+    echo "  bash scripts/run_e2e_inference.sh fx_encoder /path/to/tcn.pt input.wav target.wav results/test2"
+    exit 1
+fi
 
-echo "=========================================="
-echo "End-to-End Style Transfer"
-echo "=========================================="
-echo "Optimization target: $OPTIMIZE_TARGET"
-echo "Input audio: $INPUT_AUDIO"
-echo "Target audio: $TARGET_AUDIO"
-echo "Output directory: $OUTPUT_DIR"
-echo "Num steps: $NUM_STEPS"
-echo "Learning rate: $LR"
-echo "Segment: ${SEGMENT_DURATION}s (offset: ${SEGMENT_OFFSET}s)"
-echo "=========================================="
+echo "================================"
+echo "E2E Style Transfer Inference"
+echo "================================"
+echo "Encoder: $ENCODER_TYPE"
+echo "TCN checkpoint: $TCN_CHECKPOINT"
+echo "Input: $INPUT_AUDIO"
+echo "Target: $TARGET_AUDIO"
+echo "Output: $OUTPUT_DIR"
+echo "================================"
 echo ""
 
-# Note: Audio is segmented to 10s by default (encoder trained on 10s clips)
-python ../inference/inference_e2e_style_transfer.py \
-    --input_audio "$INPUT_AUDIO" \
-    --target_audio "$TARGET_AUDIO" \
-    --optimize_target embeddings \
-    --output_dir "${OUTPUT_DIR}_embeddings" \
-    --num_steps "$NUM_STEPS" \
-    --lr "$LR" \
-    --receptive_field 2.0 \
-    --segment_duration "$SEGMENT_DURATION" \
-    --segment_offset "$SEGMENT_OFFSET" \
-    --device cuda \
-    --use_cycle_consistency \
-    --lambda_recon 1.0 \
-    --lambda_waveform 1.0
+# Set encoder-specific arguments
+if [[ "$ENCODER_TYPE" == "mixing_style" ]]; then
+    ENCODER_ARGS="--encoder_checkpoint /nas/mixing-representation/checkpoints_adversarial/best_model.pt"
+elif [[ "$ENCODER_TYPE" == "fx_encoder" ]]; then
+    ENCODER_ARGS="--fx_encoder_model default"
+fi
 
-python ../inference/inference_e2e_style_transfer.py \
+# Run inference
+python inference/inference_e2e_style_transfer.py \
+    --encoder_type "$ENCODER_TYPE" \
+    --tcn_checkpoint "$TCN_CHECKPOINT" \
     --input_audio "$INPUT_AUDIO" \
     --target_audio "$TARGET_AUDIO" \
-    --optimize_target features \
-    --output_dir "${OUTPUT_DIR}_features" \
-    --num_steps "$NUM_STEPS" \
-    --lr "$LR" \
-    --receptive_field 2.0 \
-    --segment_duration "$SEGMENT_DURATION" \
-    --segment_offset "$SEGMENT_OFFSET" \
-    --device cuda \
-    --use_cycle_consistency \
-    --lambda_recon 1.0 \
-    --lambda_waveform 1.0
+    --output_dir "$OUTPUT_DIR" \
+    $ENCODER_ARGS \
+    --scnet_model Music-Source-Separation-Training/model_scnet_masked_ep_111_sdr_9.8286.ckpt \
+    --scnet_config Music-Source-Separation-Training/configs/config_musdb18_scnet_xl_ihf.yaml \
+    --segment_duration 10.0 \
+    --segment_offset 0.0 \
+    --device cuda
 
 echo ""
-echo "Done! Results saved to: $OUTPUT_DIR"
+echo "================================"
+echo "Inference complete!"
+echo "Results saved to: $OUTPUT_DIR"
+echo "================================"
 echo ""
 echo "Output files:"
-echo "  - ${OUTPUT_DIR}/output_transferred.wav  (style-transferred audio)"
-echo "  - ${OUTPUT_DIR}/metrics.json            (optimization metrics)"
-echo "  - ${OUTPUT_DIR}/input_original.wav      (original input)"
-echo "  - ${OUTPUT_DIR}/target_original.wav     (original target)"
-echo "  - ${OUTPUT_DIR}/input_stems/            (separated input stems)"
-echo "  - ${OUTPUT_DIR}/target_stems/           (separated target stems)"
+echo "  - $OUTPUT_DIR/transferred_audio.wav (final result)"
+echo "  - $OUTPUT_DIR/input_original.wav (input segment)"
+echo "  - $OUTPUT_DIR/target_original.wav (target segment)"
+echo "  - $OUTPUT_DIR/metadata.json (run metadata)"
+echo ""
+echo "Listen to the result:"
+echo "  play $OUTPUT_DIR/transferred_audio.wav"

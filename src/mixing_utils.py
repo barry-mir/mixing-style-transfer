@@ -68,19 +68,21 @@ class MixingFeatureExtractor:
 
         return total_dim
 
-    def extract_all_features(self, stems_dict, mixture):
+    def extract_all_features(self, stems_dict):
         """
         Extract all mixing features from separated stems.
 
         Args:
             stems_dict: Dict with keys ['vocals', 'bass', 'drums', 'other']
                        Each value is tensor of shape (2, T) for stereo
-            mixture: Stereo mixture tensor (2, T)
 
         Returns:
             features: Dict of extracted features
         """
         features = {}
+
+        # Compute mixture by summing all stems
+        mixture = sum(stems_dict.values())  # (2, T)
 
         # Per-stem features
         for stem_name, stem_audio in stems_dict.items():

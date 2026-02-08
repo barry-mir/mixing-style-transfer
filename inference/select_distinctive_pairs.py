@@ -48,8 +48,7 @@ def compute_embedding(stems, mixture, model, feature_extractor, device):
     with torch.no_grad():
         # Extract features on CPU
         stems_cpu = {k: v.cpu() for k, v in stems.items()}
-        mixture_cpu = mixture.cpu()
-        mixing_features = feature_extractor.extract_all_features(stems_cpu, mixture_cpu)
+        mixing_features = feature_extractor.extract_all_features(stems_cpu)
 
         # Move to device for model
         stems_device = {k: v.unsqueeze(0).to(device) for k, v in stems_cpu.items()}

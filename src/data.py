@@ -228,8 +228,7 @@ class FMABaselineDataset(Dataset):
                 start_idx = np.random.randint(0, max_start + 1)
 
             clip_stems = self._extract_clip(stems_full, start_idx, audio_length)
-            mixture = sum(clip_stems.values())
-            features = self.feature_extractor.extract_all_features(clip_stems, mixture)
+            features = self.feature_extractor.extract_all_features(clip_stems)
             stems_list.append(clip_stems)
             features_list.append(features)
 
@@ -244,8 +243,7 @@ class FMABaselineDataset(Dataset):
                 start_idx = 0
                 for _ in range(2):
                     clip_stems = self._extract_clip(stems_full, start_idx, audio_length)
-                    mixture = sum(clip_stems.values())
-                    features = self.feature_extractor.extract_all_features(clip_stems, mixture)
+                    features = self.feature_extractor.extract_all_features(clip_stems)
                     stems_list.append(clip_stems)
                     features_list.append(features)
             else:
@@ -254,8 +252,7 @@ class FMABaselineDataset(Dataset):
                 start1 = np.random.randint(0, max_start1 + 1)
 
                 clip_stems1 = self._extract_clip(stems_full, start1, audio_length)
-                mixture1 = sum(clip_stems1.values())
-                features1 = self.feature_extractor.extract_all_features(clip_stems1, mixture1)
+                features1 = self.feature_extractor.extract_all_features(clip_stems1)
                 stems_list.append(clip_stems1)
                 features_list.append(features1)
 
@@ -265,8 +262,7 @@ class FMABaselineDataset(Dataset):
                 start2 = np.random.randint(min_start2, max_start2 + 1)
 
                 clip_stems2 = self._extract_clip(stems_full, start2, audio_length)
-                mixture2 = sum(clip_stems2.values())
-                features2 = self.feature_extractor.extract_all_features(clip_stems2, mixture2)
+                features2 = self.feature_extractor.extract_all_features(clip_stems2)
                 stems_list.append(clip_stems2)
                 features_list.append(features2)
         else:
@@ -534,10 +530,7 @@ class StyleTransferDataset(Dataset):
         target_stems = self._random_crop_stems(target_full_stems, self.clip_samples)
 
         # Compute target mixing features
-        target_mixture = sum(target_stems.values())
-        target_features = self.feature_extractor.extract_all_features(
-            target_stems, target_mixture
-        )
+        target_features = self.feature_extractor.extract_all_features(target_stems)
 
         # Clean up
         del input_full_stems, target_full_stems

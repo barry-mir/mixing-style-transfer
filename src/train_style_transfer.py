@@ -51,6 +51,8 @@ class StyleTransferTrainer:
         lambda_cycle=0.1,  # Weight for cycle consistency loss (keep low to avoid identity collapse)
         gradient_accumulation_steps=32,  # Accumulate gradients over N steps
         use_cycle_consistency=True,  # Enable/disable cycle consistency loss
+        encoder_type='mixing_style',  # Encoder type: 'mixing_style' or 'fx_encoder'
+        encoder_embed_dim=512,  # Encoder output dimension (512 for MixingStyle, 128 for Fx-Encoder)
     ):
         self.encoder = encoder
         self.tcn = tcn
@@ -64,6 +66,8 @@ class StyleTransferTrainer:
         self.lambda_cycle = lambda_cycle if use_cycle_consistency else 0.0
         self.use_cycle_consistency = use_cycle_consistency
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.encoder_type = encoder_type
+        self.encoder_embed_dim = encoder_embed_dim
 
         # Multi-resolution STFT loss for cycle consistency
         self.mrstft_loss = MultiResolutionSTFTLoss().to(device)
@@ -125,37 +129,56 @@ class StyleTransferTrainer:
 
         # 1. Extract features for encoder conditioning (frozen, no gradients)
         with torch.no_grad():
-            # Compute input mixing features
-            input_mixture = input_batch.sum(dim=1, keepdim=True)  # (B, 2, T)
-            input_stems_for_features = {
-                name: input_stems_dict[name].to(self.device)
-                for name in ['vocals', 'bass', 'drums', 'other']
-            }
-            input_features = torch.stack([
-                self.feature_extractor.extract_all_features(
-                    {name: input_stems_for_features[name][i] for name in input_stems_for_features},
-                    input_mixture[i]
-                )
-                for i in range(input_batch.shape[0])
-            ], dim=0)  # (B, 56)
+            if self.encoder_type == "mixing_style":
+                # Move stems to device
+                input_stems_for_features = {
+                    name: input_stems_dict[name].to(self.device)
+                    for name in ['vocals', 'bass', 'drums', 'other']
+                }
+                target_stems_for_features = {
+                    name: target_stems_dict[name].to(self.device)
+                    for name in ['vocals', 'bass', 'drums', 'other']
+                }
 
-            # Compute target mixing features for conditioning
-            target_mixture = target_batch.sum(dim=1, keepdim=True)  # (B, 2, T)
-            target_stems_for_features = {
-                name: target_stems_dict[name].to(self.device)
-                for name in ['vocals', 'bass', 'drums', 'other']
-            }
-            target_features_for_encoder = torch.stack([
-                self.feature_extractor.extract_all_features(
-                    {name: target_stems_for_features[name][i] for name in target_stems_for_features},
-                    target_mixture[i]
-                )
-                for i in range(target_batch.shape[0])
-            ], dim=0)  # (B, 56)
+                # Compute input mixing features
+                input_features = torch.stack([
+                    self.feature_extractor.extract_all_features(
+                        {name: input_stems_for_features[name][i] for name in input_stems_for_features}
+                    )
+                    for i in range(input_batch.shape[0])
+                ], dim=0)  # (B, 56)
 
-            # 2. Encode input and target stems (frozen encoder, no gradients)
-            input_embedding = self.encoder(input_stems_for_features, input_features)  # (B, 512)
-            target_embedding = self.encoder(target_stems_for_features, target_features_for_encoder)  # (B, 512)
+                # Compute target mixing features for conditioning
+                target_features_for_encoder = torch.stack([
+                    self.feature_extractor.extract_all_features(
+                        {name: target_stems_for_features[name][i] for name in target_stems_for_features}
+                    )
+                    for i in range(target_batch.shape[0])
+                ], dim=0)  # (B, 56)
+
+                # 2. Encode input and target stems (frozen encoder, no gradients)
+                input_embedding = self.encoder(input_stems_for_features, input_features)  # (B, 512)
+                target_embedding = self.encoder(target_stems_for_features, target_features_for_encoder)  # (B, 512)
+
+            elif self.encoder_type == "fx_encoder":
+                # No feature conditioning needed for Fx-Encoder
+                # Move stems to device and sum to create mixture
+                input_stems_for_mixture = {
+                    name: input_stems_dict[name].to(self.device)
+                    for name in ['vocals', 'bass', 'drums', 'other']
+                }
+                target_stems_for_mixture = {
+                    name: target_stems_dict[name].to(self.device)
+                    for name in ['vocals', 'bass', 'drums', 'other']
+                }
+
+                # Convert stems to mixture (sum all stems) - (B, 2, T)
+                input_mixture = sum(input_stems_for_mixture.values())  # (B, 2, T)
+                target_mixture = sum(target_stems_for_mixture.values())  # (B, 2, T)
+
+                # 2. Encode input and target mixtures (frozen encoder, no gradients)
+                input_embedding = self.encoder.get_fx_embedding(input_mixture)  # (B, 128)
+                target_embedding = self.encoder.get_fx_embedding(target_mixture)  # (B, 128)
 
         # 3. Concatenate embeddings
         concat_embedding = torch.cat([input_embedding, target_embedding], dim=1)  # (B, 1024)
@@ -172,19 +195,24 @@ class StyleTransferTrainer:
         for i, stem_name in enumerate(['vocals', 'bass', 'drums', 'other']):
             output_stems_dict[stem_name] = output_batch[:, i*2:(i+1)*2, :]  # (B, 2, T)
 
-        # Compute output mixture and features (no grad for feature extractor)
-        output_mixture = output_batch.sum(dim=1)  # (B, 2, T) - no keepdim needed
-        output_features = torch.stack([
-            self.feature_extractor.extract_all_features(
-                {name: output_stems_dict[name][i] for name in output_stems_dict},
-                output_mixture[i]
-            )
-            for i in range(output_batch.shape[0])
-        ], dim=0)  # (B, 56)
+        if self.encoder_type == "fx_encoder":
+            # For Fx-Encoder: sum output stems to create mixture
+            output_mixture = sum(output_stems_dict.values())  # (B, 2, T)
+            # Encode output WITH gradients (encoder params frozen, but gradients flow through)
+            output_embedding = self.encoder.get_fx_embedding(output_mixture)  # (B, 128)
+        else:
+            # For MixingStyle: extract features and encode
+            # Compute output features (no grad for feature extractor)
+            output_features = torch.stack([
+                self.feature_extractor.extract_all_features(
+                    {name: output_stems_dict[name][i] for name in output_stems_dict}
+                )
+                for i in range(output_batch.shape[0])
+            ], dim=0)  # (B, 56)
 
-        # Encode output WITH gradients (encoder params frozen, but gradients flow through)
-        # This allows gradients to flow back to output_batch and optimize TCN
-        output_embedding = self.encoder(output_stems_dict, output_features)  # (B, 512)
+            # Encode output WITH gradients (encoder params frozen, but gradients flow through)
+            # This allows gradients to flow back to output_batch and optimize TCN
+            output_embedding = self.encoder(output_stems_dict, output_features)  # (B, 512)
 
         # 7. Compute style matching loss: 1 - cosine_similarity(output_emb, target_emb)
         # Normalize embeddings
@@ -390,8 +418,13 @@ def main():
                         help='Use pre-separated stems')
 
     # Model arguments
+    parser.add_argument('--encoder_type', type=str, default='mixing_style',
+                        choices=['mixing_style', 'fx_encoder'],
+                        help='Encoder type: mixing_style (stem-based) or fx_encoder (mixture-based)')
     parser.add_argument('--encoder_checkpoint', type=str, default=None,
-                        help='Path to pretrained encoder checkpoint (optional)')
+                        help='Path to pretrained encoder checkpoint (optional, only for mixing_style)')
+    parser.add_argument('--fx_encoder_model', type=str, default='default',
+                        help='Fx-Encoder model name (default, or custom path)')
     parser.add_argument('--hidden_channels', type=int, default=16,
                         help='TCN hidden channels (default: 128, reference architecture)')
     parser.add_argument('--num_blocks', type=int, default=14,
@@ -463,45 +496,64 @@ def main():
 
     # Initialize models
     print("Initializing models...")
+    print(f"Encoder type: {args.encoder_type}")
 
-    # Feature extractor (create first to get feature dimensions)
-    feature_extractor = MixingFeatureExtractor(
-        sample_rate=44100,
-        n_fft=1024,
-        hop_length=256,
-        n_mels=128,
-        use_detailed_spectral=args.use_detailed_spectral,
-        n_spectral_bins=args.n_spectral_bins
-    )
+    if args.encoder_type == "mixing_style":
+        # Feature extractor (create first to get feature dimensions)
+        feature_extractor = MixingFeatureExtractor(
+            sample_rate=44100,
+            n_fft=1024,
+            hop_length=256,
+            n_mels=128,
+            use_detailed_spectral=args.use_detailed_spectral,
+            n_spectral_bins=args.n_spectral_bins
+        )
 
-    # Get feature dimensions
-    feature_dim = feature_extractor.get_feature_dim()
-    print(f"Feature dimension: {feature_dim}")
-    if args.use_detailed_spectral:
-        print(f"  Using detailed spectral with {args.n_spectral_bins} bins")
-        spectral_dim_per_stem = args.n_spectral_bins + 2  # bins + tilt + flatness
-    else:
-        print(f"  Using 3-band spectral (old mode)")
-        spectral_dim_per_stem = 5
+        # Get feature dimensions
+        feature_dim = feature_extractor.get_feature_dim()
+        print(f"Feature dimension: {feature_dim}")
+        if args.use_detailed_spectral:
+            print(f"  Using detailed spectral with {args.n_spectral_bins} bins")
+            spectral_dim_per_stem = args.n_spectral_bins + 2  # bins + tilt + flatness
+        else:
+            print(f"  Using 3-band spectral (old mode)")
+            spectral_dim_per_stem = 5
 
-    # Encoder
-    encoder = MixingStyleEncoder(
-        sample_rate=44100,
-        n_fft=2048,
-        hop_length=512,
-        n_mels=80,
-        split_size=16,
-        overlap=8,
-        channels=8,
-        embed_dim=512,
-        feature_dim=feature_dim
-    ).to(device)
+        # Encoder
+        encoder = MixingStyleEncoder(
+            sample_rate=44100,
+            n_fft=2048,
+            hop_length=512,
+            n_mels=80,
+            split_size=16,
+            overlap=8,
+            channels=8,
+            embed_dim=512,
+            feature_dim=feature_dim
+        ).to(device)
 
-    # Load pretrained encoder if provided
-    if args.encoder_checkpoint is not None:
-        print(f"Loading pretrained encoder from {args.encoder_checkpoint}")
-        checkpoint = torch.load(args.encoder_checkpoint, map_location=device)
-        encoder.load_state_dict(checkpoint['model_state_dict'])
+        # Load pretrained encoder if provided
+        if args.encoder_checkpoint is not None:
+            print(f"Loading pretrained encoder from {args.encoder_checkpoint}")
+            checkpoint = torch.load(args.encoder_checkpoint, map_location=device)
+            encoder.load_state_dict(checkpoint['model_state_dict'])
+
+        encoder_embed_dim = 512
+
+    elif args.encoder_type == "fx_encoder":
+        # Import and load Fx-Encoder
+        sys.path.insert(0, str(Path(__file__).parent.parent / "Fx-Encoder_PlusPlus"))
+        from fxencoder_plusplus import load_model
+
+        feature_extractor = None
+        print(f"Loading Fx-Encoder model: {args.fx_encoder_model}")
+        encoder = load_model(model_name=args.fx_encoder_model, device=device)
+        encoder.eval()  # Frozen encoder
+        for param in encoder.parameters():
+            param.requires_grad = False
+        print("Fx-Encoder loaded successfully")
+
+        encoder_embed_dim = 128  # Fx-Encoder default output
 
     # TCN with FiLM conditioning
     tcn = TCNMixer(
@@ -513,18 +565,22 @@ def main():
         use_film=True
     ).to(device)
 
-    # FiLM generator
+    # FiLM generator (dynamic embed_dim based on encoder type)
+    film_input_dim = 2 * encoder_embed_dim  # Concatenate input + target embeddings
     film_generator = TCNFiLMGenerator(
-        embed_dim=1024,  # 512 + 512
+        embed_dim=film_input_dim,  # 1024 for MixingStyle (512+512), 256 for Fx-Encoder (128+128)
         num_blocks=args.num_blocks,
         hidden_channels=args.hidden_channels
     ).to(device)
+    print(f"FiLM generator input dimension: {film_input_dim}")
 
     # Freeze encoder (pretrained, no gradients)
-    encoder.eval()
-    for param in encoder.parameters():
-        param.requires_grad = False
-    print("Encoder frozen (no gradients)")
+    if args.encoder_type == "mixing_style":
+        encoder.eval()
+        for param in encoder.parameters():
+            param.requires_grad = False
+        print("MixingStyle encoder frozen (no gradients)")
+    # Fx-Encoder is already frozen during load_model()
 
     # Count parameters
     encoder_params = sum(p.numel() for p in encoder.parameters())
@@ -614,6 +670,8 @@ def main():
         lambda_cycle=args.lambda_cycle,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         use_cycle_consistency=not args.disable_cycle_consistency,
+        encoder_type=args.encoder_type,
+        encoder_embed_dim=encoder_embed_dim,
     )
 
     # Resume from checkpoint if provided

@@ -138,10 +138,8 @@ def compute_track_embedding(track_path, start_sec, duration_sec, model, feature_
         }
 
     # Compute mixing features
-    mixture = sum(stems_dict.values())
     mixing_features = feature_extractor.extract_all_features(
-        {k: torch.from_numpy(v).float() for k, v in stems_dict.items()},
-        torch.from_numpy(mixture).float()
+        {k: torch.from_numpy(v).float() for k, v in stems_dict.items()}
     )
 
     # Compute embedding

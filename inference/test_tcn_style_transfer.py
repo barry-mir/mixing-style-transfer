@@ -32,10 +32,9 @@ def compute_mixing_embedding(mixture_audio, stems_dict, model, feature_extractor
         # No gradients needed - use CPU and detach for efficiency
         with torch.no_grad():
             stems_cpu = {k: v.detach().cpu() if v.is_cuda else v for k, v in stems_dict.items()}
-            mixture_cpu = mixture_audio.detach().cpu() if mixture_audio.is_cuda else mixture_audio
 
             # Extract features on CPU
-            mixing_features = feature_extractor.extract_all_features(stems_cpu, mixture_cpu)
+            mixing_features = feature_extractor.extract_all_features(stems_cpu)
 
             # Move to device for model
             stems_device = {k: v.unsqueeze(0).to(device) for k, v in stems_cpu.items()}
@@ -46,10 +45,9 @@ def compute_mixing_embedding(mixture_audio, stems_dict, model, feature_extractor
         # WITH gradients - keep everything on device, no detach!
         # Move stems to device (without detaching to preserve gradients)
         stems_device_cpu = {k: v.cpu() for k, v in stems_dict.items()}
-        mixture_cpu = mixture_audio.cpu()
 
         # Extract features WITH gradients (no torch.no_grad!)
-        mixing_features = feature_extractor.extract_all_features(stems_device_cpu, mixture_cpu)
+        mixing_features = feature_extractor.extract_all_features(stems_device_cpu)
 
         # Move everything to device
         stems_device = {k: v.unsqueeze(0).to(device) for k, v in stems_dict.items()}  # Original stems with grad
